@@ -279,11 +279,11 @@ def identify(data, path=None):
             method = "Indication Sony S-Log2 détectée."
             action = "CST DaVinci Resolve : Input Color Space = S-Gamut, Input Gamma = Sony S-Log2 -> DaVinci Wide Gamut / Intermediate."
         elif "rec709" in sg or "itu709" in sg or "s-cinetone" in sg:
-profile = "Sony S-Cinetone / Rec.709" if "cinetone" in sg else "Sony Rec.709 (Standard / PP Off)"
-gamut = "Rec.709"
-confidence = "Confirmé" if sony_gamma else "Probable"
-method = f"XML Sony CaptureGammaEquation = {sony_gamma}" if sony_gamma else "Profil standard Sony détecté."
-action = "Signal déjà en Rec.709 : pas de CST Log nécessaire (ou CST Rec.709 -> DaVinci Wide Gamut si workflow DWG)."
+            profile = "Sony S-Cinetone / Rec.709" if "cinetone" in sg else "Sony Rec.709 (Standard / PP Off)"
+            gamut = "Rec.709"
+            confidence = "Confirmé" if sony_gamma else "Probable"
+            method = f"XML Sony CaptureGammaEquation = {sony_gamma}" if sony_gamma else "Profil standard Sony détecté."
+            action = "Signal déjà en Rec.709 : pas de CST Log nécessaire (ou CST Rec.709 -> DaVinci Wide Gamut si workflow DWG)."
 # --- 4. RÈGLES SPÉCIFIQUES DJI (AVEC DÉDUCTION 10-BIT MEDIAINFO) ---
 if dji and not profile:
 is_10bit = str(bitdepth) == "10" or "10" in str(format_profile)
