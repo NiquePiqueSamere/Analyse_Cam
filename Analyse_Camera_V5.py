@@ -284,101 +284,106 @@ def identify(data, path=None):
             confidence = "Confirmé" if sony_gamma else "Probable"
             method = f"XML Sony CaptureGammaEquation = {sony_gamma}" if sony_gamma else "Profil standard Sony détecté."
             action = "Signal déjà en Rec.709 : pas de CST Log nécessaire (ou CST Rec.709 -> DaVinci Wide Gamut si workflow DWG)."
-# --- 4. RÈGLES SPÉCIFIQUES DJI (AVEC DÉDUCTION 10-BIT MEDIAINFO) ---
-if dji and not profile:
-is_10bit = str(bitdepth) == "10" or "10" in str(format_profile)
-if "d-log m" in tagtext or "d-logm" in tagtext or "dlogm" in tagtext:
-profile = "DJI D-Log M"
-gamut = "Rec.709 (Encodage D-Log M)"
-confidence = "Confirmé"
-method = "Tag explicite DJI D-Log M."
-action = "Utiliser la LUT officielle DJI D-Log M -> Rec.709 spécifique au modèle (" + (model or "DJI") + "). Ne pas utiliser de CST D-Log/D-Gamut classique."
-elif "d-log" in tagtext or "dlog" in tagtext:
-profile = "DJI D-Log"
-gamut = "DJI D-Gamut"
-confidence = "Confirmé"
-method = "Tag explicite DJI D-Log."
-action = "CST DaVinci Resolve : Input Color Space = DJI D-Gamut, Input Gamma = DJI D-Log -> DaVinci Wide Gamut / Intermediate."
-elif "hlg" in tagtext or "arib-std-b67" in tagtext:
-profile = "DJI HLG (HDR)"
-gamut = "BT.2020"
-confidence = "Confirmé"
-method = "Courbe de transfert HLG détectée."
-action = "CST DaVinci Resolve : Input Color Space = Rec.2020, Input Gamma = Rec.2100 HLG."
-elif is_10bit:
-profile = "DJI D-Log M (Très probable - Vidéo 10-bit)"
-gamut = "Rec.709 (Conteneur)"
-confidence = "Probable"
-method = f"Drone DJI encodé en {bitdepth}-bit ({format_profile or codec}) sans tag HLG : sur DJI récent, le 10-bit correspond quasi systématiquement au mode D-Log M."
-action = f"Si l'image est plate/désaturée : appliquer la LUT officielle DJI [{model or 'Modèle DJI'}] D-Log M to Rec.709. (Si l'image est déjà contrastée, traiter en Rec.709)."
-else:
-profile = "DJI Normal (Rec.709)"
-gamut = "Rec.709"
-confidence = "Confirmé"
-method = f"Drone DJI encodé en {bitdepth or '8'}-bit avec flags BT.709 : le D-Log / D-Log M n'est pas disponible en 8-bit sur ces modèles."
-action = "Signal Rec.709 standard : aucun CST Log requis (ou CST Rec.709 -> DaVinci Wide Gamut / Intermediate)."
-# --- 5. AUTRES CONSTRUCTEURS (CANON, FUJI, PANASONIC, APPLE, HDR) ---
-if not profile:
-if "canonlogversion" in tagtext or re.search(r"canon.?log.?3|clog.?3", tagtext):
-profile = "Canon Log 3"
-gamut = "Cinema Gamut / BT.709 (vérifier ColorSpace2)"
-confidence = "Confirmé"
-method = "Tag Canon Log 3 détecté."
-action = "CST : Input Gamma = Canon Log 3, Input Color Space = Canon Cinema Gamut (ou Rec.709 selon réglage boîtier)."
-elif "com.fujifilm.bt2020.f-log2" in tagtext or "f-log2" in tagtext:
-profile = "Fujifilm F-Log2"
-gamut = "F-Gamut / BT.2020"
-confidence = "Confirmé"
-method = "Tag Fujifilm F-Log2 détecté."
-action = "CST : Input Color Space = Rec.2020 (ou Fujifilm F-Gamut), Input Gamma = Fujifilm F-Log2."
-elif "f-log" in tagtext:
-profile = "Fujifilm F-Log"
-gamut = "Fujifilm F-Gamut"
-confidence = "Probable"
-method = "Tag Fujifilm F-Log détecté."
-action = "CST : Input Color Space = Fujifilm F-Gamut, Input Gamma = Fujifilm F-Log."
-elif "v-log" in tagtext or "vlog" in tagtext:
-profile = "Panasonic V-Log"
-gamut = "V-Gamut"
-confidence = "Probable"
-method = "Tag Panasonic V-Log détecté."
-action = "CST : Input Color Space = Panasonic V-Gamut, Input Gamma = Panasonic V-Log."
-elif "apple log" in tagtext or "applelog" in tagtext:
-profile = "Apple Log"
-gamut = "Rec.2020"
-confidence = "Confirmé"
-method = "Tag Apple Log détecté."
-action = "CST : Input Color Space = Rec.2020, Input Gamma = Apple Log."
-elif "hlg" in tagtext or "arib-std-b67" in tagtext:
-profile = "HLG (HDR)"
-gamut = "Rec.2020"
-confidence = "Probable"
-method = "Transfert HLG détecté."
-action = "CST : Input Color Space = Rec.2020, Input Gamma = Rec.2100 HLG."
-if not model:
-model = "Modèle non identifié"
-if not make:
-make = "Fabricant non identifié"
-tech_bit = f"{bitdepth} bits" if bitdepth and "bit" not in str(bitdepth).lower() else (bitdepth or "Non renseigné")
-if chroma:
-tech_bit += f" ({chroma})"
-return {
-"make": make,
-"model": model,
-"profile": profile or "Non identifié",
-"gamut": gamut or "Non identifié",
-"confidence": confidence,
-"method": method,
-"action": action,
-"primaries": primaries or "Non renseigné",
-"transfer": transfer or "Non renseigné",
-"matrix": matrix or "Non renseigné",
-"codec": f"{codec} ({format_profile})" if codec and format_profile else (codec or "Non renseigné"),
-"bitdepth": tech_bit,
-"resolution": (f"{width} x {height}" if width and height else "Non renseignée"),
-"fps": fps or "Non renseignée",
-"xml_found": "Oui (" + Path(data["_Analyse:XMLPath"]).name + ")" if data.get("_Analyse:XMLPath") else "Non"
-}
+
+    # --- 4. RÈGLES SPÉCIFIQUES DJI (AVEC DÉDUCTION 10-BIT MEDIAINFO) ---
+    if dji and not profile:
+        is_10bit = str(bitdepth) == "10" or "10" in str(format_profile)
+        if "d-log m" in tagtext or "d-logm" in tagtext or "dlogm" in tagtext:
+            profile = "DJI D-Log M"
+            gamut = "Rec.709 (Encodage D-Log M)"
+            confidence = "Confirmé"
+            method = "Tag explicite DJI D-Log M."
+            action = "Utiliser la LUT officielle DJI D-Log M -> Rec.709 spécifique au modèle (" + (model or "DJI") + "). Ne pas utiliser de CST D-Log/D-Gamut classique."
+        elif "d-log" in tagtext or "dlog" in tagtext:
+            profile = "DJI D-Log"
+            gamut = "DJI D-Gamut"
+            confidence = "Confirmé"
+            method = "Tag explicite DJI D-Log."
+            action = "CST DaVinci Resolve : Input Color Space = DJI D-Gamut, Input Gamma = DJI D-Log -> DaVinci Wide Gamut / Intermediate."
+        elif "hlg" in tagtext or "arib-std-b67" in tagtext:
+            profile = "DJI HLG (HDR)"
+            gamut = "BT.2020"
+            confidence = "Confirmé"
+            method = "Courbe de transfert HLG détectée."
+            action = "CST DaVinci Resolve : Input Color Space = Rec.2020, Input Gamma = Rec.2100 HLG."
+        elif is_10bit:
+            profile = "DJI D-Log M (Très probable - Vidéo 10-bit)"
+            gamut = "Rec.709 (Conteneur)"
+            confidence = "Probable"
+            method = f"Drone DJI encodé en {bitdepth}-bit ({format_profile or codec}) sans tag HLG : sur DJI récent, le 10-bit correspond quasi systématiquement au mode D-Log M."
+            action = f"Si l'image est plate/désaturée : appliquer la LUT officielle DJI [{model or 'Modèle DJI'}] D-Log M to Rec.709. (Si l'image est déjà contrastée, traiter en Rec.709)."
+        else:
+            profile = "DJI Normal (Rec.709)"
+            gamut = "Rec.709"
+            confidence = "Confirmé"
+            method = f"Drone DJI encodé en {bitdepth or '8'}-bit avec flags BT.709 : le D-Log / D-Log M n'est pas disponible en 8-bit sur ces modèles."
+            action = "Signal Rec.709 standard : aucun CST Log requis (ou CST Rec.709 -> DaVinci Wide Gamut / Intermediate)."
+
+    # --- 5. AUTRES CONSTRUCTEURS (CANON, FUJI, PANASONIC, APPLE, HDR) ---
+    if not profile:
+        if "canonlogversion" in tagtext or re.search(r"canon.?log.?3|clog.?3", tagtext):
+            profile = "Canon Log 3"
+            gamut = "Cinema Gamut / BT.709 (vérifier ColorSpace2)"
+            confidence = "Confirmé"
+            method = "Tag Canon Log 3 détecté."
+            action = "CST : Input Gamma = Canon Log 3, Input Color Space = Canon Cinema Gamut (ou Rec.709 selon réglage boîtier)."
+        elif "com.fujifilm.bt2020.f-log2" in tagtext or "f-log2" in tagtext:
+            profile = "Fujifilm F-Log2"
+            gamut = "F-Gamut / BT.2020"
+            confidence = "Confirmé"
+            method = "Tag Fujifilm F-Log2 détecté."
+            action = "CST : Input Color Space = Rec.2020 (ou Fujifilm F-Gamut), Input Gamma = Fujifilm F-Log2."
+        elif "f-log" in tagtext:
+            profile = "Fujifilm F-Log"
+            gamut = "Fujifilm F-Gamut"
+            confidence = "Probable"
+            method = "Tag Fujifilm F-Log détecté."
+            action = "CST : Input Color Space = Fujifilm F-Gamut, Input Gamma = Fujifilm F-Log."
+        elif "v-log" in tagtext or "vlog" in tagtext:
+            profile = "Panasonic V-Log"
+            gamut = "V-Gamut"
+            confidence = "Probable"
+            method = "Tag Panasonic V-Log détecté."
+            action = "CST : Input Color Space = Panasonic V-Gamut, Input Gamma = Panasonic V-Log."
+        elif "apple log" in tagtext or "applelog" in tagtext:
+            profile = "Apple Log"
+            gamut = "Rec.2020"
+            confidence = "Confirmé"
+            method = "Tag Apple Log détecté."
+            action = "CST : Input Color Space = Rec.2020, Input Gamma = Apple Log."
+        elif "hlg" in tagtext or "arib-std-b67" in tagtext:
+            profile = "HLG (HDR)"
+            gamut = "Rec.2020"
+            confidence = "Probable"
+            method = "Transfert HLG détecté."
+            action = "CST : Input Color Space = Rec.2020, Input Gamma = Rec.2100 HLG."
+
+    if not model:
+        model = "Modèle non identifié"
+    if not make:
+        make = "Fabricant non identifié"
+
+    tech_bit = f"{bitdepth} bits" if bitdepth and "bit" not in str(bitdepth).lower() else (bitdepth or "Non renseigné")
+    if chroma:
+        tech_bit += f" ({chroma})"
+
+    return {
+        "make": make,
+        "model": model,
+        "profile": profile or "Non identifié",
+        "gamut": gamut or "Non identifié",
+        "confidence": confidence,
+        "method": method,
+        "action": action,
+        "primaries": primaries or "Non renseigné",
+        "transfer": transfer or "Non renseigné",
+        "matrix": matrix or "Non renseigné",
+        "codec": f"{codec} ({format_profile})" if codec and format_profile else (codec or "Non renseigné"),
+        "bitdepth": tech_bit,
+        "resolution": (f"{width} x {height}" if width and height else "Non renseignée"),
+        "fps": fps or "Non renseignée",
+        "xml_found": "Oui (" + Path(data["_Analyse:XMLPath"]).name + ")" if data.get("_Analyse:XMLPath") else "Non"
+    }
 class App:
 def init(self, root):
 self.root = root
