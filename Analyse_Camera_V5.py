@@ -101,6 +101,61 @@ THEMES = {
         "mi_tag": "#005cc5",
         "exif_tag": "#22863a",
     }
+    MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
+
+
+class RoundedButton(tk.Canvas):
+    """Bouton moderne avec coins arrondis et effet de survol."""
+    def __init__(self, parent, text, command=None, radius=10, padx=14, pady=6,
+                 bg="#2c313c", hover_bg="#3e4451", fg="#ffffff", canvas_bg="#181a1f", font=None):
+        self.font = font or (MONO_FONT, 9, "bold")
+        tmp = tk.Label(parent, text=text, font=self.font)
+        w = tmp.winfo_reqwidth() + padx * 2
+        h = tmp.winfo_reqheight() + pady * 2
+        tmp.destroy()
+
+        super().__init__(parent, width=w, height=h, bg=canvas_bg, highlightthickness=0, cursor="hand2")
+        self.command = command
+        self.radius = radius
+        self.bg_normal = bg
+        self.bg_hover = hover_bg
+        self.fg_color = fg
+        self.text_str = text
+
+        self._draw(self.bg_normal)
+        self.bind("<Enter>", lambda e: self._draw(self.bg_hover))
+        self.bind("<Leave>", lambda e: self._draw(self.bg_normal))
+        self.bind("<Button-1>", self._on_click)
+
+    def _round_rect(self, x1, y1, x2, y2, r, **kwargs):
+        pts = [
+            x1+r, y1, x2-r, y1, x2, y1, x2, y1+r,
+            x2, y2-r, x2, y2, x2-r, y2, x1+r, y2,
+            x1, y2, x1, y2-r, x1, y1+r, x1, y1
+        ]
+        return self.create_polygon(pts, smooth=True, **kwargs)
+
+    def _draw(self, fill_color):
+        self.delete("all")
+        w, h = int(self["width"]), int(self["height"])
+        self._round_rect(1, 1, w - 1, h - 1, self.radius, fill=fill_color, outline="")
+        self.create_text(w // 2, h // 2, text=self.text_str, fill=self.fg_color, font=self.font)
+
+    def _on_click(self, event):
+        if self.command:
+            self.command()
+
+    def set_text(self, new_text):
+        self.text_str = new_text
+        self._draw(self.bg_normal)
+
+    def update_colors(self, bg, hover_bg, fg, canvas_bg):
+        self.bg_normal = bg
+        self.bg_hover = hover_bg
+        self.fg_color = fg
+        self.configure(bg=canvas_bg)
+        self._draw(self.bg_normal)
+
 }
 
 
@@ -416,22 +471,35 @@ class App:
         if "clam" in self.style.theme_names():
             self.style.theme_use("clam")
 
+        self.buttons = []
         self.top = ttk.Frame(self.root, padding=10)
         self.top.pack(fill="x")
-        ttk.Button(self.top, text="Importer videos...", command=self.pick).pack(side="left")
-        ttk.Button(self.top, text="Importer dossier...", command=self.pick_folder).pack(side="left", padx=(6, 0))
-        ttk.Button(self.top, text="Reanalyser", command=lambda: self.analyze(force=True)).pack(side="left", padx=(6, 0))
-        ttk.Button(self.top, text="Copier rapport", command=self.copy_report).pack(side="left", padx=(6, 0))
-        ttk.Button(self.top, text="Exporter tableau CSV...", command=self.export_csv).pack(side="left", padx=(6, 0))
-        ttk.Button(self.top, text="JSON...", command=self.export_dump).pack(side="left", padx=(6, 0))
 
-        self.theme_btn = ttk.Button(self.top, text="Mode Clair", command=self.toggle_theme)
+        btn_specs = [
+            ("Importer videos...", self.pick),
+            ("Importer dossier...", self.pick_folder),
+            ("Reanalyser", lambda: self.analyze(force=True)),
+            ("Copier rapport", self.copy_report),
+            ("Exporter CSV...", self.export_csv),
+            ("JSON...", self.export_dump),
+        ]
+        for label, cmd in btn_specs:
+            b = RoundedButton(self.top, text=label, command=cmd)
+            b.pack(side="left", padx=(0, 6))
+            self.buttons.append(b)
+
+        self.theme_btn = RoundedButton(self.top, text="Mode Clair", command=self.toggle_theme)
         self.theme_btn.pack(side="right", padx=(12, 0))
+        self.buttons.append(self.theme_btn)
 
-        self.status = ttk.Label(self.top, text="Pret")
+        self.status = ttk.Label(self.top, text="Pret", font=(MONO_FONT, 9))
         self.status.pack(side="right")
 
-        self.drop_label = tk.Label(self.root, text="Glisse-depose tes videos ou dossiers de rushs (DJI, Sony, Canon, etc.) ici", anchor="center", pady=10, font=("Segoe UI", 9, "bold"))
+        self.drop_label = tk.Label(
+            self.root,
+            text="[ Glisse-depose tes videos ou dossiers de rushs (DJI, Sony, Canon...) ici ]",
+            anchor="center", pady=10, font=(MONO_FONT, 9, "bold")
+        )
         self.drop_label.pack(fill="x", padx=10, pady=(0, 8))
 
         self.body = ttk.Panedwindow(self.root, orient="horizontal")
@@ -439,47 +507,49 @@ class App:
 
         left = ttk.Frame(self.body, padding=5)
         self.body.add(left, weight=1)
-        ttk.Label(left, text="Fichiers analyses", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.listbox = tk.Listbox(left, width=36, activestyle="dotbox", borderwidth=1, highlightthickness=0, font=("Segoe UI", 9))
+        ttk.Label(left, text="FICHIERS ANALYSES", font=(MONO_FONT, 10, "bold")).pack(anchor="w")
+        self.listbox = tk.Listbox(left, width=36, activestyle="dotbox", borderwidth=1, highlightthickness=0, font=(MONO_FONT, 9))
         self.listbox.pack(fill="both", expand=True, pady=5)
         self.listbox.bind("<<ListboxSelect>>", self._select)
 
         right = ttk.Frame(self.body, padding=8)
         self.body.add(right, weight=4)
-        self.heading = ttk.Label(right, text="Aucun fichier charge", font=("Segoe UI", 14, "bold"), wraplength=780)
+        self.heading = ttk.Label(right, text="Aucun fichier charge", font=(MONO_FONT, 13, "bold"), wraplength=780)
         self.heading.pack(anchor="w", pady=(0, 8))
 
-        self.summary = tk.Text(right, height=13, wrap="word", font=("Segoe UI", 10), relief="flat", padx=10, pady=8, borderwidth=1)
+        self.summary = tk.Text(right, height=13, wrap="word", font=(MONO_FONT, 10), relief="flat", padx=12, pady=10, borderwidth=1)
         self.summary.pack(fill="x", pady=4)
 
-        ttk.Label(right, text="Metadonnees techniques & tags detectes", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 2))
-        self.details = tk.Text(right, wrap="none", font=("Consolas", 9), relief="flat", padx=10, pady=8, borderwidth=1)
+        ttk.Label(right, text="METADONNEES TECHNIQUES & TAGS DETECTES", font=(MONO_FONT, 10, "bold")).pack(anchor="w", pady=(8, 2))
+        self.details = tk.Text(right, wrap="none", font=(MONO_FONT, 9), relief="flat", padx=12, pady=10, borderwidth=1)
         self.details.pack(fill="both", expand=True)
 
         nav = ttk.Frame(right)
         nav.pack(fill="x", pady=8)
-        ttk.Button(nav, text="< Precedent", command=lambda: self.navigate(-1)).pack(side="left")
-        ttk.Button(nav, text="Suivant >", command=lambda: self.navigate(1)).pack(side="left", padx=6)
-        self.counter = ttk.Label(nav, text="0 / 0")
+        b_prev = RoundedButton(nav, text="< Precedent", command=lambda: self.navigate(-1), radius=8, padx=12, pady=4)
+        b_prev.pack(side="left")
+        b_next = RoundedButton(nav, text="Suivant >", command=lambda: self.navigate(1), radius=8, padx=12, pady=4)
+        b_next.pack(side="left", padx=6)
+        self.buttons.extend([b_prev, b_next])
+
+        self.counter = ttk.Label(nav, text="0 / 0", font=(MONO_FONT, 9, "bold"))
         self.counter.pack(side="right")
 
-    def toggle_theme(self):
-        new_theme = "light" if self.theme_name == "dark" else "dark"
-        self.apply_theme(new_theme)
-        if self.results and self.results[self.index] is not None:
-            self.show(self.index)
 
     def apply_theme(self, name):
         self.theme_name = name
         t = THEMES[name]
-        self.theme_btn.config(text="Mode Clair" if name == "dark" else "Mode Sombre")
+        self.theme_btn.set_text("Mode Clair" if name == "dark" else "Mode Sombre")
 
         self.root.configure(bg=t["bg"])
         self.style.configure("TFrame", background=t["bg"])
         self.style.configure("TPanedwindow", background=t["bg"])
-        self.style.configure("TLabel", background=t["bg"], foreground=t["fg"])
-        self.style.configure("TButton", background=t["panel"], foreground=t["fg_bright"], borderwidth=1)
-        self.style.map("TButton", background=[("active", t["select_bg"])])
+        self.style.configure("TLabel", background=t["bg"], foreground=t["fg"], font=(MONO_FONT, 9))
+
+        btn_bg = "#2c313c" if name == "dark" else "#e1e4e8"
+        btn_hover = "#3e4451" if name == "dark" else "#d1d5da"
+        for b in getattr(self, "buttons", []):
+            b.update_colors(bg=btn_bg, hover_bg=btn_hover, fg=t["fg_bright"], canvas_bg=t["bg"])
 
         self.drop_label.config(bg=t["drop_bg"], fg=t["drop_fg"])
         self.listbox.config(bg=t["panel"], fg=t["fg"], selectbackground=t["select_bg"], selectforeground=t["select_fg"])
@@ -487,19 +557,21 @@ class App:
         self.details.config(bg=t["text_bg"], fg=t["fg"], insertbackground=t["fg_bright"], highlightbackground=t["border"])
 
         for widget in (self.summary, self.details):
-            widget.tag_configure("label", foreground=t["label"], font=("Segoe UI", 10, "bold") if widget == self.summary else ("Consolas", 9))
-            widget.tag_configure("camera", foreground=t["camera"], font=("Segoe UI", 10, "bold"))
-            widget.tag_configure("log", foreground=t["log"], font=("Segoe UI", 10, "bold") if widget == self.summary else ("Consolas", 9, "bold"))
-            widget.tag_configure("rec709", foreground=t["rec709"], font=("Segoe UI", 10, "bold") if widget == self.summary else ("Consolas", 9, "bold"))
-            widget.tag_configure("ok", foreground=t["ok"], font=("Segoe UI", 10, "bold") if widget == self.summary else ("Consolas", 9, "bold"))
-            widget.tag_configure("warn", foreground=t["warn"], font=("Segoe UI", 10, "bold") if widget == self.summary else ("Consolas", 9, "bold"))
-            widget.tag_configure("err", foreground=t["err"], font=("Segoe UI", 10, "bold") if widget == self.summary else ("Consolas", 9, "bold"))
-            widget.tag_configure("cst_title", foreground=t["cst"], font=("Segoe UI", 10, "bold"))
-            widget.tag_configure("cst_body", foreground=t["fg_bright"], font=("Segoe UI", 10))
-            widget.tag_configure("xml_tag", foreground=t["xml_tag"])
-            widget.tag_configure("mi_tag", foreground=t["mi_tag"])
-            widget.tag_configure("exif_tag", foreground=t["exif_tag"])
-            widget.tag_configure("val_normal", foreground=t["fg_bright"])
+            sz = 10 if widget == self.summary else 9
+            widget.tag_configure("label", foreground=t["label"], font=(MONO_FONT, sz, "bold") if widget == self.summary else (MONO_FONT, sz))
+            widget.tag_configure("camera", foreground=t["camera"], font=(MONO_FONT, sz, "bold"))
+            widget.tag_configure("log", foreground=t["log"], font=(MONO_FONT, sz, "bold"))
+            widget.tag_configure("rec709", foreground=t["rec709"], font=(MONO_FONT, sz, "bold"))
+            widget.tag_configure("ok", foreground=t["ok"], font=(MONO_FONT, sz, "bold"))
+            widget.tag_configure("warn", foreground=t["warn"], font=(MONO_FONT, sz, "bold"))
+            widget.tag_configure("err", foreground=t["err"], font=(MONO_FONT, sz, "bold"))
+            widget.tag_configure("cst_title", foreground=t["cst"], font=(MONO_FONT, sz, "bold"))
+            widget.tag_configure("cst_body", foreground=t["fg_bright"], font=(MONO_FONT, sz))
+            widget.tag_configure("xml_tag", foreground=t["xml_tag"], font=(MONO_FONT, sz))
+            widget.tag_configure("mi_tag", foreground=t["mi_tag"], font=(MONO_FONT, sz))
+            widget.tag_configure("exif_tag", foreground=t["exif_tag"], font=(MONO_FONT, sz))
+            widget.tag_configure("val_normal", foreground=t["fg_bright"], font=(MONO_FONT, sz))
+
 
     def _show_status(self):
         et_txt = "ExifTool OK" if self.exiftool else "ExifTool MANQUANT"
