@@ -101,7 +101,9 @@ THEMES = {
         "mi_tag": "#005cc5",
         "exif_tag": "#22863a",
     }
-    MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
+    
+}
+MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
 
 
 class RoundedButton(tk.Canvas):
@@ -155,9 +157,6 @@ class RoundedButton(tk.Canvas):
         self.fg_color = fg
         self.configure(bg=canvas_bg)
         self._draw(self.bg_normal)
-
-}
-
 
 def norm(value):
     return re.sub(r"[^a-z0-9]+", "", str(value).lower())
@@ -571,6 +570,7 @@ class App:
             widget.tag_configure("mi_tag", foreground=t["mi_tag"], font=(MONO_FONT, sz))
             widget.tag_configure("exif_tag", foreground=t["exif_tag"], font=(MONO_FONT, sz))
             widget.tag_configure("val_normal", foreground=t["fg_bright"], font=(MONO_FONT, sz))
+
 
 
     def _show_status(self):
