@@ -556,19 +556,41 @@ class App:
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _run_exiftool(self, path, deep=False):
-        cmd = [self.exiftool, "-json", "-G0:1:2:3", "-a", "-u"]
+        import tempfile
+        args = ["-json", "-G0:1:2:3", "-a", "-u"]
         if deep:
-            cmd += ["-ee"]
-        cmd += ["-api", "RequestAll=3", "-charset", "filename=UTF8", path]
-        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=300 if deep else 180,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            args.append("-ee")
+        args.extend(["-api", "RequestAll=3", "-charset", "filename=UTF8", str(path)])
+
+        # Ecrit les arguments dans un fichier UTF-8 pour eviter la corruption des accents (ex: Côte Brune) sous Windows
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8", delete=False) as tf:
+            tf.write("\n".join(args))
+            argfile = tf.name
+
+        try:
+            cmd = [self.exiftool, "-@", argfile]
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300 if deep else 180,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+        finally:
+            try:
+                os.remove(argfile)
+            except OSError:
+                pass
+
         out = (proc.stdout or "").strip()
         if not out:
             raise RuntimeError(proc.stderr.strip() or f"ExifTool n'a renvoye aucune donnee (code {proc.returncode}).")
         parsed = json.loads(out)
         data = parsed[0] if parsed else {}
         return {k: v for k, v in data.items() if not re.search(r":Doc(?:[2-9]|\d{2,}):", k)}
+
 
     def _run_mediainfo(self, path):
         if not HAS_PYMEDIAINFO:
