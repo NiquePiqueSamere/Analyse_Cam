@@ -185,17 +185,22 @@ def parse_sony_xml(xml_path):
 
 
 def find_exiftool():
+    base_dir = Path(__file__).resolve().parent
     candidates = [
-        Path(sys.executable).parent / "exiftool.exe",
+        base_dir / "exiftool.exe",
         Path.cwd() / "exiftool.exe",
-        Path(__file__).resolve().parent / "exiftool.exe",
-        Path.home() / "Downloads" / "exiftool.exe",
-        Path(r"C:\Users\Mist\Downloads\exiftool-13.64_64\exiftool-13.64_64\exiftool.exe"),
+        Path(sys.executable).parent / "exiftool.exe",
     ]
+    # Cherche aussi dans d'eventuels sous-dossiers exiftool-* locaux ou dans Telechargements
+    for folder in (base_dir, Path.home() / "Downloads"):
+        if folder.is_dir():
+            candidates.extend(folder.glob("exiftool*/exiftool.exe"))
+
     for p in candidates:
         if p.is_file():
             return str(p)
     return shutil.which("exiftool") or shutil.which("exiftool.exe")
+
 
 
 def identify(data, path=None):
