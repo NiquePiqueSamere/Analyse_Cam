@@ -79,7 +79,7 @@ THEMES = {
         "exif_tag": "#98c379",
     },
     "light": {
-        "bg": "#f0f2f5",
+        "bg": "#FAFAFA",
         "panel": "#ffffff",
         "text_bg": "#fafafa",
         "fg": "#2c313a",
@@ -108,7 +108,7 @@ MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
 
 class RoundedButton(tk.Canvas):
     """Bouton moderne avec coins arrondis et effet de survol."""
-    def __init__(self, parent, text, command=None, radius=10, padx=14, pady=6,
+    def __init__(self, parent, text, command=None, radius=16, padx=14, pady=6,
                  bg="#2c313c", hover_bg="#3e4451", fg="#ffffff", canvas_bg="#181a1f", font=None):
         self.font = font or (MONO_FONT, 9, "bold")
         tmp = tk.Label(parent, text=text, font=self.font)
@@ -525,15 +525,20 @@ class App:
 
         nav = ttk.Frame(right)
         nav.pack(fill="x", pady=8)
-        b_prev = RoundedButton(nav, text="< Precedent", command=lambda: self.navigate(-1), radius=8, padx=12, pady=4)
+        b_prev = RoundedButton(nav, text="< Precedent", command=lambda: self.navigate(-1), radius=12, padx=12, pady=4)
         b_prev.pack(side="left")
-        b_next = RoundedButton(nav, text="Suivant >", command=lambda: self.navigate(1), radius=8, padx=12, pady=4)
+        b_next = RoundedButton(nav, text="Suivant >", command=lambda: self.navigate(1), radius=12, padx=12, pady=4)
         b_next.pack(side="left", padx=6)
         self.buttons.extend([b_prev, b_next])
 
         self.counter = ttk.Label(nav, text="0 / 0", font=(MONO_FONT, 9, "bold"))
         self.counter.pack(side="right")
 
+    def toggle_theme(self):
+        new_theme = "light" if self.theme_name == "dark" else "dark"
+        self.apply_theme(new_theme)
+        if self.results and self.results[self.index] is not None:
+            self.show(self.index)
 
     def apply_theme(self, name):
         self.theme_name = name
