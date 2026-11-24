@@ -279,7 +279,6 @@ def identify(data, path=None):
             method = "Indication Sony S-Log2 détectée."
             action = "CST DaVinci Resolve : Input Color Space = S-Gamut, Input Gamma = Sony S-Log2 -> DaVinci Wide Gamut / Intermediate."
         elif "rec709" in sg or "itu709" in sg or "s-cinetone" in sg:
-
 profile = "Sony S-Cinetone / Rec.709" if "cinetone" in sg else "Sony Rec.709 (Standard / PP Off)"
 gamut = "Rec.709"
 confidence = "Confirmé" if sony_gamma else "Probable"
