@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Analyse Camera V5.3
+Analyse Camera V5.4
 Assistant d'identification camera (DJI, Sony, Canon, Fuji, etc.), profils couleur
 et preparation CST pour DaVinci Resolve.
 Combine ExifTool + pymediainfo + lecture automatique des fichiers Sidecar XML (Sony/Canon).
@@ -26,7 +26,7 @@ try:
 except ImportError:
     HAS_PYMEDIAINFO = False
 
-APP_VERSION = "5.3"
+APP_VERSION = "5.4"
 DEEP_SCAN = False
 
 VIDEO_EXTS = {
@@ -475,7 +475,7 @@ class App:
             self.drop_enabled = True
         except Exception:
             self.drop_enabled = False
-            self.drop_label.config(text="Glisser-depose des videos ou dossiers ici (lance via le .BAT pour activer le glisser-deposer)")
+            self.drop_label.config(text="Glisser-depose des videos ou dossiers ici (lance via le fichier .command ou .BAT pour activer le glisser-deposer)")
         self._show_status()
 
     def _build(self):
@@ -643,7 +643,7 @@ class App:
             self.pick()
             return
         if not self.exiftool:
-            messagebox.showerror("ExifTool requis", "ExifTool est introuvable. Lancez Lancer_Analyse_Camera_V5.bat pour l'installer automatiquement.")
+            messagebox.showerror("ExifTool requis", "ExifTool est introuvable. Fermez l’application puis relancez le lanceur Analyse Camera (.command sur Mac, .bat sur Windows) pour terminer son installation.")
             return
         self.busy = True
         self.status.config(text="Analyse en cours...")
