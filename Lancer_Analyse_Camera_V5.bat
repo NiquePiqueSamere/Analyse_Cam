@@ -1,8 +1,10 @@
 @echo off
-rem LAUNCHER_VERSION=2
+rem LAUNCHER_VERSION=4
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 title Verification et Lancement - Analyse Camera
+set "LOG=%~dp0lancement.log"
+>> "%LOG%" echo ==== %date% %time% ====
 
 echo ========================================================
 echo   VERIFICATION DE L'ENVIRONNEMENT (ANALYSE CAMERA)
@@ -30,11 +32,26 @@ if not defined PY_CMD (
     exit /b 1
 )
 echo [OK] Python detecte : %PY_CMD%
+>> "%LOG%" echo PY_CMD=%PY_CMD%
 
-rem --- 2. Mise a jour (lanceur d'abord, puis outil) depuis GitHub ---
+rem --- 2. Mise a jour depuis GitHub (l'outil, et le lanceur en .bat.new) ---
 if exist "%~dp0updater.py" (
     %PY_CMD% "%~dp0updater.py"
-    if errorlevel 10 exit /b 0
+    >> "%LOG%" echo updater errorlevel=!errorlevel!
+)
+
+rem --- 2b. Application d'un nouveau lanceur : sur une seule ligne logique, puis relance en direct ---
+if exist "%~f0.new" (
+    echo [*] Nouveau lanceur recu : application et relance...
+    >> "%LOG%" echo application du nouveau lanceur
+    copy /y "%~f0" "%~f0.bak" >nul
+    copy /y "%~f0.new" "%~f0" >nul && (
+        del "%~f0.new" >nul 2>&1
+        set "LAUNCHER_JUST_UPDATED=1"
+        call "%~f0" %*
+        exit /b !errorlevel!
+    )
+    echo [!] Impossible d'appliquer le nouveau lanceur : on continue avec l'ancien.
 )
 
 rem --- 3. Modules Python ---
@@ -44,7 +61,14 @@ echo [OK] Modules Python prets.
 
 rem --- 4. ExifTool ---
 set "ET_FOUND=0"
-if exist "%~dp0exiftool.exe" set "ET_FOUND=1"
+if exist "%~dp0exiftool.exe" (
+    if exist "%~dp0exiftool_files\" (
+        set "ET_FOUND=1"
+    ) else (
+        for %%F in ("%~dp0exiftool.exe") do if %%~zF GTR 1000000 set "ET_FOUND=1"
+        if "!ET_FOUND!"=="0" echo [!] exiftool.exe est seul, sans dossier exiftool_files : inutilisable, ignore.
+    )
+)
 where exiftool >nul 2>&1 && set "ET_FOUND=1"
 if "!ET_FOUND!"=="0" (
     echo [!] ExifTool introuvable. Installation via winget...
@@ -63,9 +87,15 @@ if not exist "%SCRIPT%" (
 )
 
 %PY_CMD% "%SCRIPT%" %*
-if errorlevel 1 (
+set "RC=!errorlevel!"
+>> "%LOG%" echo outil termine code=!RC!
+if not "!RC!"=="0" (
     echo.
     echo [ERREUR] Le programme s'est ferme avec une erreur.
     pause
+) else (
+    echo.
+    echo [i] L'outil s'est ferme normalement ^(code 0^). Cette fenetre se ferme dans 10 s.
+    timeout /t 10
 )
 endlocal
