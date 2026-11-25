@@ -238,23 +238,36 @@ def parse_sony_xml(xml_path):
     return extracted
 
 
+def _exiftool_usable(p):
+    """Windows : le exiftool.exe de ~58 Ko n'est qu'un lanceur et exige le dossier exiftool_files a cote.
+    macOS/Linux : le script (ou binaire) doit etre executable."""
+    try:
+        if p.suffix.lower() == ".exe":
+            return (p.parent / "exiftool_files").is_dir() or p.stat().st_size > 1_000_000
+        return os.access(str(p), os.X_OK)
+    except OSError:
+        return False
+
+
 def find_exiftool():
     base_dir = Path(__file__).resolve().parent
-    candidates = [
-        base_dir / "exiftool.exe",
-        Path.cwd() / "exiftool.exe",
-        Path(sys.executable).parent / "exiftool.exe",
-    ]
+    names = ("exiftool.exe",) if os.name == "nt" else ("exiftool",)
+    candidates = []
+    for n in names:
+        candidates += [base_dir / n, Path.cwd() / n, Path(sys.executable).parent / n]
     # Cherche aussi dans d'eventuels sous-dossiers exiftool-* locaux ou dans Telechargements
     for folder in (base_dir, Path.home() / "Downloads"):
         if folder.is_dir():
-            candidates.extend(folder.glob("exiftool*/exiftool.exe"))
+            for n in names:
+                candidates.extend(folder.glob(f"*xif*ool*/{n}"))
+    if os.name != "nt":
+        # Une app lancee hors terminal n'a pas toujours /opt/homebrew/bin dans son PATH
+        candidates += [Path("/opt/homebrew/bin/exiftool"), Path("/usr/local/bin/exiftool")]
 
     for p in candidates:
-        if p.is_file():
+        if p.is_file() and _exiftool_usable(p):
             return str(p)
     return shutil.which("exiftool") or shutil.which("exiftool.exe")
-
 
 
 def identify(data, path=None):
