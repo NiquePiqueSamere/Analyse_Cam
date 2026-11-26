@@ -29,6 +29,11 @@ except ImportError:
 APP_VERSION = "5.4"
 DEEP_SCAN = False
 
+# Extensions nécessitant une lecture approfondie des métadonnées.
+DEEP_SCAN_EXTS = {
+    ".mxf", ".ari", ".r3d", ".braw", ".crm"
+}
+
 VIDEO_EXTS = {
     ".mov", ".mp4", ".mxf", ".mkv", ".avi", ".mts",
     ".m2ts", ".braw", ".r3d", ".crm", ".ari", ".mpg", ".m4v"
@@ -194,6 +199,40 @@ def looks_dji(path, data):
         if "dji" in key.lower() or "dji" in str(value).lower():
             return True
     return False
+def metadata_text(data, path=None):
+    """
+    Construit un texte de recherche à partir de toutes les métadonnées.
+    Inclut les noms de tags, leurs valeurs et éventuellement le nom du fichier.
+    """
+    parts = []
+
+    if path:
+        parts.append(Path(path).name)
+
+    for key, value in data.items():
+        if key == "SourceFile":
+            continue
+
+        parts.append(str(key))
+
+        if isinstance(value, (str, int, float)):
+            parts.append(str(value))
+        elif isinstance(value, (list, tuple)):
+            parts.extend(str(v) for v in value)
+
+    return " ".join(parts)
+
+
+def find_camera_model(text, patterns):
+    """
+    Retourne le premier modèle correspondant à une liste de motifs.
+    Les motifs sont testés dans l'ordre : placer les modèles précis avant
+    les modèles génériques.
+    """
+    for pattern, model in patterns:
+        if re.search(pattern, text, re.I):
+            return model
+    return ""
 
 
 def find_sidecar_xml(video_path):
@@ -318,10 +357,147 @@ def identify(data, path=None):
     confidence = "Indetermine"
     method = "Aucun tag de profil Log suffisamment explicite detecte."
     action = "Ne pas appliquer de CST camera au hasard. Verifier le menu image de la camera ou tester visuellement la courbe."
+    # ==========================================================
+    # DETECTION ARRI
+    # ==========================================================
+
+    fulltext = metadata_text(data, path)
+    text_norm = fulltext.lower()
+
+    arri_detected = (
+        "arri" in text_norm
+        or "arriraw" in text_norm
+        or "alexa" in text_norm
+    )
+
+    if arri_detected:
+
+        if not make or make == "Fabricant non identifie":
+            make = "ARRI"
+
+        # Identification des modèles.
+        # Les modèles les plus spécifiques sont recherchés en premier.
+        arri_models = [
+            (r"alexa\s*35", "ALEXA 35"),
+            (r"alexa\s*mini\s*lf", "ALEXA Mini LF"),
+            (r"alexa\s*lf", "ALEXA LF"),
+            (r"alexa\s*65", "ALEXA 65"),
+            (r"alexa\s*mini", "ALEXA Mini"),
+            (r"\bamira\b", "AMIRA"),
+            (r"alexa\s*xt", "ALEXA XT"),
+            (r"\balexa\b", "ALEXA (generation non identifiee)"),
+        ]
+
+        arri_model = find_camera_model(text_norm, arri_models)
+
+        if arri_model:
+            model = "ARRI " + arri_model
+
+        # Recherche des indications de gamma et de gamut explicites.
+        logc4_explicit = bool(re.search(
+            r"log[\s_-]*c[\s_-]*4|logc4",
+            text_norm
+        ))
+
+        logc3_explicit = bool(re.search(
+            r"log[\s_-]*c[\s_-]*3|logc3",
+            text_norm
+        ))
+
+        awg4_explicit = bool(re.search(
+            r"arri[\s_-]*wide[\s_-]*gamut[\s_-]*4|awg[\s_-]*4",
+            text_norm
+        ))
+
+        awg3_explicit = bool(re.search(
+            r"arri[\s_-]*wide[\s_-]*gamut[\s_-]*3|awg[\s_-]*3",
+            text_norm
+        ))
+
+        # Recherche d'informations sur le format RAW.
+        is_arriraw = bool(re.search(
+            r"arriraw|arri\s*raw",
+            text_norm
+        ))
+
+        if logc4_explicit:
+            profile = "ARRI LogC4"
+            confidence = "Confirme"
+            method = "Indication LogC4 explicitement presente dans les metadonnees."
+
+        elif logc3_explicit:
+            profile = "ARRI LogC3"
+            confidence = "Confirme"
+            method = "Indication LogC3 explicitement presente dans les metadonnees."
+
+        elif arri_model == "ALEXA 35":
+            profile = "ARRI LogC4 (deduit du modele)"
+            confidence = "Probable"
+            method = (
+                "Modele ALEXA 35 identifie. "
+                "LogC4 est le workflow standard de cette generation, "
+                "mais le gamma de developpement doit etre verifie."
+            )
+
+        elif arri_model:
+            profile = "ARRI LogC3 (deduit du modele)"
+            confidence = "Probable"
+            method = (
+                "Modele ARRI identifie. LogC3 est probable pour cette generation, "
+                "mais le gamma de developpement doit etre verifie."
+            )
+
+        # Gamut.
+        if awg4_explicit:
+            gamut = "ARRI Wide Gamut 4"
+
+        elif awg3_explicit:
+            gamut = "ARRI Wide Gamut 3"
+
+        elif arri_model == "ALEXA 35" or logc4_explicit:
+            gamut = "ARRI Wide Gamut 4 (probable)"
+
+        elif arri_model or logc3_explicit:
+            gamut = "ARRI Wide Gamut 3 (probable)"
+
+        # Nature de l'enregistrement.
+        if is_arriraw:
+            method += " Format ARRIRAW detecte."
+        elif not is_arriraw:
+            method += " Format d'enregistrement a verifier."
+
+        # Conseil Resolve.
+        if "LogC4" in profile:
+            action = (
+                "Verifier le developpement Camera RAW dans DaVinci Resolve. "
+                "Si la sortie est bien en LogC4 / ARRI Wide Gamut 4, "
+                "utiliser un CST avec Input Color Space = ARRI Wide Gamut 4 "
+                "et Input Gamma = ARRI LogC4. "
+                "Ne pas appliquer un second CST si le RAW a deja ete developpe "
+                "dans un autre espace couleur."
+            )
+
+        elif "LogC3" in profile:
+            action = (
+                "Verifier le developpement Camera RAW dans DaVinci Resolve. "
+                "Si la sortie est bien en LogC3 / ARRI Wide Gamut 3, "
+                "utiliser un CST avec Input Color Space = ARRI Wide Gamut 3 "
+                "et Input Gamma = ARRI LogC3."
+            )
+
+        else:
+            action = (
+                "Camera ARRI detectee, mais profil couleur non determine. "
+                "Verifier les parametres de developpement RAW avant de choisir un CST."
+            )
+
+        if not arri_model:
+            model = "Modele ARRI non identifie"
+            confidence = "Probable"
 
     sony_gamma = metadata_value(data, "XML:CaptureGammaEquation")
     sony_prim = metadata_value(data, "XML:CaptureColorPrimaries")
-    if sony_gamma or "sony" in make.lower() or "xavc" in tagtext:
+    if not profile and (sony_gamma or "sony" in make.lower() or "xavc" in tagtext):
         if not make:
             make = "Sony"
         sg = (sony_gamma or tagtext).lower()
@@ -703,6 +879,7 @@ class App:
         except Exception:
             return {}
 
+    
     def _worker(self):
         for i, path in enumerate(self.files):
             try:
@@ -712,13 +889,26 @@ class App:
 
                 data = self._run_exiftool(path, deep=DEEP_SCAN)
 
-                if not DEEP_SCAN and looks_dji(path, data):
+                # Scan approfondi pour les formats professionnels et les fichiers DJI.
+                ext = Path(path).suffix.lower()
+
+                needs_deep_scan = (
+                    DEEP_SCAN
+                    or ext in DEEP_SCAN_EXTS
+                    or looks_dji(path, data)
+                )
+
+                if needs_deep_scan:
                     try:
                         d2 = self._run_exiftool(path, deep=True)
-                        d2["_Analyse:DeepPass"] = "ee"
-                        data = d2
-                    except Exception:
-                        pass
+
+                        # Conserver également les métadonnées du premier passage.
+                        # Le scan approfondi peut ne pas restituer certains tags initiaux.
+                        data.update(d2)
+                        data["_Analyse:DeepPass"] = "ee"
+
+                    except Exception as e:
+                        data["_Analyse:DeepScanError"] = str(e)
 
                 mi_data = self._run_mediainfo(path)
                 data.update(mi_data)
@@ -730,9 +920,12 @@ class App:
 
                 self.cache[path] = data
                 self.q.put(("result", i, path, data, None))
+
             except Exception as e:
                 self.q.put(("result", i, path, {}, str(e)))
+
         self.q.put(("done",))
+
     def _poll(self):
         try:
             while True:
