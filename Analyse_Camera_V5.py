@@ -29,11 +29,6 @@ except ImportError:
 APP_VERSION = "5.4"
 DEEP_SCAN = False
 
-# Extensions nécessitant une lecture approfondie des métadonnées.
-DEEP_SCAN_EXTS = {
-    ".mxf", ".ari", ".r3d", ".braw", ".crm"
-}
-
 VIDEO_EXTS = {
     ".mov", ".mp4", ".mxf", ".mkv", ".avi", ".mts",
     ".m2ts", ".braw", ".r3d", ".crm", ".ari", ".mpg", ".m4v"
@@ -106,7 +101,7 @@ THEMES = {
         "mi_tag": "#005cc5",
         "exif_tag": "#22863a",
     }
-    
+
 }
 MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
 
@@ -163,6 +158,7 @@ class RoundedButton(tk.Canvas):
         self.configure(bg=canvas_bg)
         self._draw(self.bg_normal)
 
+
 def norm(value):
     return re.sub(r"[^a-z0-9]+", "", str(value).lower())
 
@@ -199,40 +195,6 @@ def looks_dji(path, data):
         if "dji" in key.lower() or "dji" in str(value).lower():
             return True
     return False
-def metadata_text(data, path=None):
-    """
-    Construit un texte de recherche à partir de toutes les métadonnées.
-    Inclut les noms de tags, leurs valeurs et éventuellement le nom du fichier.
-    """
-    parts = []
-
-    if path:
-        parts.append(Path(path).name)
-
-    for key, value in data.items():
-        if key == "SourceFile":
-            continue
-
-        parts.append(str(key))
-
-        if isinstance(value, (str, int, float)):
-            parts.append(str(value))
-        elif isinstance(value, (list, tuple)):
-            parts.extend(str(v) for v in value)
-
-    return " ".join(parts)
-
-
-def find_camera_model(text, patterns):
-    """
-    Retourne le premier modèle correspondant à une liste de motifs.
-    Les motifs sont testés dans l'ordre : placer les modèles précis avant
-    les modèles génériques.
-    """
-    for pattern, model in patterns:
-        if re.search(pattern, text, re.I):
-            return model
-    return ""
 
 
 def find_sidecar_xml(video_path):
@@ -309,9 +271,56 @@ def find_exiftool():
     return shutil.which("exiftool") or shutil.which("exiftool.exe")
 
 
+def mxf_camera_identity(data):
+    """Recupere les champs d'identite MXF en conservant leur groupe CopyN."""
+    groups = {}
+    wanted = {
+        "applicationsuppliername",
+        "applicationname",
+        "applicationversionstring",
+    }
+
+    for key, value in data.items():
+        if value in (None, "", []):
+            continue
+        parts = str(key).split(":")
+        tag = norm(parts[-1])
+        if tag not in wanted:
+            continue
+        group = ":".join(parts[:-1])
+        if isinstance(value, list):
+            value = ", ".join(map(str, value))
+        groups.setdefault(group, {})[tag] = str(value)
+
+    candidates = list(groups.values())
+    candidates.sort(key=lambda item: (
+        "arri" not in item.get("applicationsuppliername", "").lower(),
+        not bool(item.get("applicationname")),
+    ))
+
+    for item in candidates:
+        supplier = item.get("applicationsuppliername", "")
+        application = item.get("applicationname", "")
+        version = item.get("applicationversionstring", "")
+        if supplier or application:
+            return supplier, application, version
+
+    return "", "", ""
+
+
 def identify(data, path=None):
     make = metadata_value(data, "XML:Make", "Make", "Manufacturer", "CameraManufacturer")
     model = metadata_value(data, "XML:Model", "Model", "CameraModelName", "CameraModel", "AppleProappsModelname")
+    mxf_supplier, mxf_application, mxf_version = mxf_camera_identity(data)
+
+    # Les champs Application* du MXF peuvent identifier le fabricant et le modele.
+    if mxf_supplier and "arri" in mxf_supplier.lower():
+        make = "ARRI"
+    if mxf_application and re.search(r"alexa|amira", mxf_application, re.I):
+        model = mxf_application.strip()
+        if not model.lower().startswith("arri"):
+            model = "ARRI " + model
+
     dji = looks_dji(path, data)
 
     if dji and not make:
@@ -351,153 +360,119 @@ def identify(data, path=None):
         if isinstance(value, (str, int, float)):
             tags.append(f"{key}={value}")
     tagtext = " ".join(tags).lower()
+    # Le nom de fichier peut aider a reconnaitre une famille de camera,
+    # mais ne doit jamais servir de preuve pour un profil Log ou un codec RAW.
+    filename_text = Path(path).name.lower() if path else ""
+    arri_identity_text = " ".join((make, model, mxf_supplier, mxf_application, tagtext)).lower()
+    arri_detected = (
+        "arri" in arri_identity_text
+        or bool(re.search(r"\balexa\b|\bamira\b", arri_identity_text))
+        or bool(re.search(r"arri|alexa|amira", filename_text))
+    )
+
+    if arri_detected and (not model or model == "Modele non identifie"):
+        model_source = arri_identity_text + " " + filename_text
+        arri_models = (
+            (r"alexa\s*35", "ARRI ALEXA 35"),
+            (r"alexa\s*mini\s*lf", "ARRI ALEXA Mini LF"),
+            (r"alexa\s*lf", "ARRI ALEXA LF"),
+            (r"alexa\s*65", "ARRI ALEXA 65"),
+            (r"alexa\s*mini", "ARRI ALEXA Mini"),
+            (r"\bamira\b", "ARRI AMIRA"),
+            (r"alexa", "ARRI ALEXA (modele a preciser)"),
+        )
+        for pattern, label in arri_models:
+            if re.search(pattern, model_source, re.I):
+                model = label
+                break
 
     profile = ""
     gamut = ""
     confidence = "Indetermine"
     method = "Aucun tag de profil Log suffisamment explicite detecte."
     action = "Ne pas appliquer de CST camera au hasard. Verifier le menu image de la camera ou tester visuellement la courbe."
-    # ==========================================================
-    # DETECTION ARRI
-    # ==========================================================
-
-    fulltext = metadata_text(data, path)
-    text_norm = fulltext.lower()
-
-    arri_detected = (
-        "arri" in text_norm
-        or "arriraw" in text_norm
-        or "alexa" in text_norm
-    )
 
     if arri_detected:
+        # Ces detections proviennent exclusivement des metadonnees, jamais du nom du fichier.
+        logc4_explicit = bool(re.search(r"log\s*c\s*4|logc4", tagtext, re.I))
+        logc3_explicit = bool(re.search(r"log\s*c\s*3|logc3", tagtext, re.I))
+        awg4_explicit = bool(re.search(r"arri\s*wide\s*gamut\s*4|awg4", tagtext, re.I))
+        awg3_explicit = bool(re.search(r"arri\s*wide\s*gamut\s*3|awg3", tagtext, re.I))
+        is_arriraw = bool(re.search(r"arriraw|arri\s*raw", tagtext, re.I))
 
-        if not make or make == "Fabricant non identifie":
+        if not make or "non identifie" in make.lower():
             make = "ARRI"
-
-        # Identification des modèles.
-        # Les modèles les plus spécifiques sont recherchés en premier.
-        arri_models = [
-            (r"alexa\s*35", "ALEXA 35"),
-            (r"alexa\s*mini\s*lf", "ALEXA Mini LF"),
-            (r"alexa\s*lf", "ALEXA LF"),
-            (r"alexa\s*65", "ALEXA 65"),
-            (r"alexa\s*mini", "ALEXA Mini"),
-            (r"\bamira\b", "AMIRA"),
-            (r"alexa\s*xt", "ALEXA XT"),
-            (r"\balexa\b", "ALEXA (generation non identifiee)"),
-        ]
-
-        arri_model = find_camera_model(text_norm, arri_models)
-
-        if arri_model:
-            model = "ARRI " + arri_model
-
-        # Recherche des indications de gamma et de gamut explicites.
-        logc4_explicit = bool(re.search(
-            r"log[\s_-]*c[\s_-]*4|logc4",
-            text_norm
-        ))
-
-        logc3_explicit = bool(re.search(
-            r"log[\s_-]*c[\s_-]*3|logc3",
-            text_norm
-        ))
-
-        awg4_explicit = bool(re.search(
-            r"arri[\s_-]*wide[\s_-]*gamut[\s_-]*4|awg[\s_-]*4",
-            text_norm
-        ))
-
-        awg3_explicit = bool(re.search(
-            r"arri[\s_-]*wide[\s_-]*gamut[\s_-]*3|awg[\s_-]*3",
-            text_norm
-        ))
-
-        # Recherche d'informations sur le format RAW.
-        is_arriraw = bool(re.search(
-            r"arriraw|arri\s*raw",
-            text_norm
-        ))
 
         if logc4_explicit:
             profile = "ARRI LogC4"
             confidence = "Confirme"
-            method = "Indication LogC4 explicitement presente dans les metadonnees."
-
         elif logc3_explicit:
             profile = "ARRI LogC3"
             confidence = "Confirme"
-            method = "Indication LogC3 explicitement presente dans les metadonnees."
-
-        elif arri_model == "ALEXA 35":
-            profile = "ARRI LogC4 (deduit du modele)"
+        elif re.search(r"alexa\s*35|alexa\s*mini\s*lf|alexa\s*lf|alexa\s*65", model, re.I):
+            profile = "ARRI LogC4 (probable - a verifier dans Camera RAW)"
             confidence = "Probable"
-            method = (
-                "Modele ALEXA 35 identifie. "
-                "LogC4 est le workflow standard de cette generation, "
-                "mais le gamma de developpement doit etre verifie."
-            )
-
-        elif arri_model:
-            profile = "ARRI LogC3 (deduit du modele)"
+        elif "alexa" in model.lower() or "amira" in model.lower():
+            profile = "ARRI LogC (generation a confirmer)"
             confidence = "Probable"
-            method = (
-                "Modele ARRI identifie. LogC3 est probable pour cette generation, "
-                "mais le gamma de developpement doit etre verifie."
-            )
 
-        # Gamut.
         if awg4_explicit:
             gamut = "ARRI Wide Gamut 4"
-
         elif awg3_explicit:
             gamut = "ARRI Wide Gamut 3"
+        elif "logc4" in profile.lower():
+            gamut = "ARRI Wide Gamut 4 (probable - a verifier)"
+        elif "logc3" in profile.lower():
+            gamut = "ARRI Wide Gamut 3 (probable - a verifier)"
+        elif profile:
+            gamut = "Gamut ARRI a confirmer"
 
-        elif arri_model == "ALEXA 35" or logc4_explicit:
-            gamut = "ARRI Wide Gamut 4 (probable)"
-
-        elif arri_model or logc3_explicit:
-            gamut = "ARRI Wide Gamut 3 (probable)"
-
-        # Nature de l'enregistrement.
         if is_arriraw:
-            method += " Format ARRIRAW detecte."
-        elif not is_arriraw:
-            method += " Format d'enregistrement a verifier."
+            method = "Tag ARRIRAW trouve dans les metadonnees. "
+        elif profile:
+            method = "Profil ARRI identifie a partir des metadonnees. "
+        else:
+            method = "Camera ARRI identifiee, mais aucun tag de courbe Log explicite trouve. "
 
-        # Conseil Resolve.
-        if "LogC4" in profile:
-            action = (
-                "Verifier le developpement Camera RAW dans DaVinci Resolve. "
-                "Si la sortie est bien en LogC4 / ARRI Wide Gamut 4, "
-                "utiliser un CST avec Input Color Space = ARRI Wide Gamut 4 "
-                "et Input Gamma = ARRI LogC4. "
-                "Ne pas appliquer un second CST si le RAW a deja ete developpe "
-                "dans un autre espace couleur."
+        if mxf_application:
+            method += (
+                f"Identite MXF : {mxf_supplier or 'fournisseur non renseigne'} / "
+                f"{mxf_application}"
+                + (f" ({mxf_version})" if mxf_version else "")
+                + ". "
             )
+        elif "arri" not in arri_identity_text:
+            method += "Identification a partir du nom de fichier uniquement : a confirmer. "
 
-        elif "LogC3" in profile:
+        if is_arriraw:
             action = (
-                "Verifier le developpement Camera RAW dans DaVinci Resolve. "
-                "Si la sortie est bien en LogC3 / ARRI Wide Gamut 3, "
-                "utiliser un CST avec Input Color Space = ARRI Wide Gamut 3 "
-                "et Input Gamma = ARRI LogC3."
+                "Dans DaVinci Resolve, verifier d'abord les reglages Camera RAW / Decode Using. "
+                "Choisir le debayering et l'espace/gamma de developpement souhaites. "
+                "Si le RAW est developpe directement en LogC4 / AWG4 dans Resolve, ne pas ajouter "
+                "un second CST d'entree. Si le fichier a deja ete debayerise/exporte, verifier "
+                "les valeurs de sortie avant de choisir un CST."
             )
-
+        elif profile:
+            action = (
+                "Verifier le gamma et le gamut de developpement dans les reglages Camera RAW "
+                "ou dans les metadonnees du fichier. Pour un signal LogC4 / AWG4 confirme : "
+                "CST Input Color Space = ARRI Wide Gamut 4, Input Gamma = ARRI LogC4, "
+                "Output = DaVinci Wide Gamut / DaVinci Intermediate. Ne pas appliquer ce CST "
+                "si le RAW est deja developpe dans un autre espace."
+            )
         else:
             action = (
-                "Camera ARRI detectee, mais profil couleur non determine. "
-                "Verifier les parametres de developpement RAW avant de choisir un CST."
+                "Ne pas appliquer de CST ARRI sans connaitre le developpement du fichier. "
+                "Verifier les reglages Camera RAW et les informations de gamma/gamut du media."
             )
 
-        if not arri_model:
-            model = "Modele ARRI non identifie"
-            confidence = "Probable"
+        if not (logc4_explicit or logc3_explicit or awg4_explicit or awg3_explicit or is_arriraw):
+            if "arri" not in arri_identity_text:
+                method += "Le nom de fichier est un indice, pas une preuve des reglages d'enregistrement."
 
     sony_gamma = metadata_value(data, "XML:CaptureGammaEquation")
     sony_prim = metadata_value(data, "XML:CaptureColorPrimaries")
-    if not profile and (sony_gamma or "sony" in make.lower() or "xavc" in tagtext):
+    if sony_gamma or "sony" in make.lower() or "xavc" in tagtext:
         if not make:
             make = "Sony"
         sg = (sony_gamma or tagtext).lower()
@@ -625,6 +600,8 @@ def identify(data, path=None):
         "fps": fps or "Non renseignee",
         "xml_found": "Oui (" + Path(data["_Analyse:XMLPath"]).name + ")" if data.get("_Analyse:XMLPath") else "Non"
     }
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -771,6 +748,7 @@ class App:
         et_txt = "ExifTool OK" if self.exiftool else "ExifTool MANQUANT"
         mi_txt = "MediaInfo OK" if HAS_PYMEDIAINFO else "pymediainfo manquant"
         self.status.config(text=f"{et_txt}  |  {mi_txt}")
+
     def pick(self):
         paths = filedialog.askopenfilenames(title="Choisir des fichiers video", filetypes=[
             ("Videos", "*.mov *.mp4 *.mxf *.mkv *.avi *.mts *.m2ts *.braw *.r3d *.crm *.ari *.mpg *.m4v"),
@@ -862,7 +840,6 @@ class App:
         data = parsed[0] if parsed else {}
         return {k: v for k, v in data.items() if not re.search(r":Doc(?:[2-9]|\d{2,}):", k)}
 
-
     def _run_mediainfo(self, path):
         if not HAS_PYMEDIAINFO:
             return {}
@@ -878,8 +855,6 @@ class App:
             return mi_data
         except Exception:
             return {}
-
-    
     def _worker(self):
         for i, path in enumerate(self.files):
             try:
@@ -889,26 +864,13 @@ class App:
 
                 data = self._run_exiftool(path, deep=DEEP_SCAN)
 
-                # Scan approfondi pour les formats professionnels et les fichiers DJI.
-                ext = Path(path).suffix.lower()
-
-                needs_deep_scan = (
-                    DEEP_SCAN
-                    or ext in DEEP_SCAN_EXTS
-                    or looks_dji(path, data)
-                )
-
-                if needs_deep_scan:
+                if not DEEP_SCAN and looks_dji(path, data):
                     try:
                         d2 = self._run_exiftool(path, deep=True)
-
-                        # Conserver également les métadonnées du premier passage.
-                        # Le scan approfondi peut ne pas restituer certains tags initiaux.
-                        data.update(d2)
-                        data["_Analyse:DeepPass"] = "ee"
-
-                    except Exception as e:
-                        data["_Analyse:DeepScanError"] = str(e)
+                        d2["_Analyse:DeepPass"] = "ee"
+                        data = d2
+                    except Exception:
+                        pass
 
                 mi_data = self._run_mediainfo(path)
                 data.update(mi_data)
@@ -920,10 +882,8 @@ class App:
 
                 self.cache[path] = data
                 self.q.put(("result", i, path, data, None))
-
             except Exception as e:
                 self.q.put(("result", i, path, {}, str(e)))
-
         self.q.put(("done",))
 
     def _poll(self):
@@ -1019,7 +979,12 @@ class App:
             self.details.insert("end", f"{v}\n", vtag)
 
         self.details.insert("end", "\n--- Tags detailles (XML / MediaInfo / ExifTool) ---\n", "cst_title")
-        selected = all_values(r["data"], [r"^XML:", r"^MI:", r"model", r"make", r"log", r"gamut", r"color", r"primar", r"transfer", r"gamma", r"codec", r"lens", r"camera", r"dji", r"encoder", r"iso", r"white"])
+        selected = all_values(r["data"], [
+            r"^XML:", r"^MI:", r"model", r"make", r"manufacturer",
+            r"application", r"supplier", r"log", r"gamut", r"color",
+            r"primar", r"transfer", r"gamma", r"codec", r"lens",
+            r"camera", r"dji", r"encoder", r"iso", r"white"
+        ])
         for k, v in selected[:250]:
             if k.startswith("XML:"):
                 k_tag = "xml_tag"
@@ -1128,4 +1093,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
