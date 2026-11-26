@@ -1789,23 +1789,6 @@ class App:
         self.listbox.pack(fill="both", expand=True, pady=5)
         self.listbox.bind("<<ListboxSelect>>", self._select)
 
-        ttk.Label(
-            left,
-            text="FICHIERS ANALYSÉS",
-            font=(MONO_FONT, 10, "bold")
-        ).pack(anchor="w")
-
-        self.listbox = tk.Listbox(
-            left,
-            width=36,
-            activestyle="dotbox",
-            borderwidth=1,
-            highlightthickness=0,
-            font=(MONO_FONT, 9)
-        )
-        self.listbox.pack(fill="both", expand=True, pady=5)
-        self.listbox.bind("<<ListboxSelect>>", self._select)
-
         right = ttk.Frame(self.body, padding=8)
         self.body.add(right, weight=4)
 
