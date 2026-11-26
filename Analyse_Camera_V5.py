@@ -1,22 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-Analyse Camera V5.4
-Assistant d'identification camera (DJI, Sony, Canon, Fuji, etc.), profils couleur
-et preparation CST pour DaVinci Resolve.
-Combine ExifTool + pymediainfo + lecture automatique des fichiers Sidecar XML (Sony/Canon).
-Inclut un mode sombre/clair, une coloration syntaxique et un export CSV compatible Excel.
+Analyse Camera V5.8.0
+Assistant d'identification caméra et profils couleur pour DaVinci Resolve.
+
+Fonctions :
+- ExifTool + MediaInfo + Sidecar XML Sony / Canon
+- Moteur de profils multi-caméras extensible (Sony, Canon, ARRI, Apple, DJI,
+  GoPro, Panasonic, Fujifilm, Blackmagic, RED, Android)
+- Détection des incohérences colorimétriques multi-sources (dont HLG / BT.709)
+- Décodage natif des métadonnées dynamiques ARRI MXF + navigation image / timecode
+- Interface Tkinter, thèmes clair/sombre, code couleur des statuts
+- Retour visuel sur le bouton Copier rapport ("Copié !")
+- Export CSV récapitulatif et JSON des métadonnées
 """
+
 import csv
 import json
 import os
 import re
+import struct
 import subprocess
 import threading
 import queue
 import shutil
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
+
 from pathlib import Path
+from decimal import Decimal, ROUND_HALF_UP
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -26,7 +39,8 @@ try:
 except ImportError:
     HAS_PYMEDIAINFO = False
 
-APP_VERSION = "5.4"
+
+APP_VERSION = "5.8.0"
 DEEP_SCAN = False
 
 VIDEO_EXTS = {
@@ -73,6 +87,7 @@ THEMES = {
         "ok": "#98c379",
         "warn": "#e5c07b",
         "err": "#e06c75",
+        "unknown": "#8b929e",
         "cst": "#d19a66",
         "xml_tag": "#c678dd",
         "mi_tag": "#61afef",
@@ -96,38 +111,184 @@ THEMES = {
         "ok": "#22863a",
         "warn": "#b08800",
         "err": "#cb2431",
+        "unknown": "#6a737d",
         "cst": "#d73a49",
         "xml_tag": "#6f42c1",
         "mi_tag": "#005cc5",
         "exif_tag": "#22863a",
     }
-
 }
+
 MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
 
 
+# ==================================================
+# CATALOGUE DE PROFILS MULTI-CAMÉRAS (EXTENSIBLE)
+# ==================================================
+
+CAMERA_PROFILES = [
+    {
+        "id": "braw_camera_raw",
+        "priority": 10,
+        "make_override": "Blackmagic Design",
+        "model_hint": "Caméra Blackmagic (BRAW)",
+        "match_regex": r"\.braw\b|blackmagic\s*design|braw",
+        "confirmed": "Blackmagic RAW",
+        "probable": "",
+        "gamut": "Blackmagic Wide Gamut Gen 5",
+        "confidence": "Confirmé",
+        "method": "Flux Blackmagic RAW (.BRAW) détecté.",
+        "action": (
+            "BRAW : régler le décodage dans l'onglet Camera RAW de DaVinci Resolve "
+            "(Blackmagic Design Film Gen 5 / BRAW) ; ne pas empiler un CST redondant."
+        ),
+    },
+    {
+        "id": "red_r3d_camera_raw",
+        "priority": 11,
+        "make_override": "RED",
+        "model_hint": "Caméra RED (R3D)",
+        "match_regex": r"\.r3d\b|redwidegamutrgb|log3g10|\bred\s*digital\s*cinema",
+        "confirmed": "RED Log3G10",
+        "probable": "",
+        "gamut": "REDWideGamutRGB",
+        "confidence": "Confirmé",
+        "method": "Flux RED (.R3D / IPP2) détecté.",
+        "action": (
+            "R3D : régler le pipeline IPP2 / Camera RAW dans DaVinci Resolve "
+            "(REDWideGamutRGB / Log3G10) avant toute conversion de sortie."
+        ),
+    },
+    {
+        "id": "canon_crm_raw",
+        "priority": 12,
+        "make_override": "Canon",
+        "model_hint": "",
+        "match_regex": r"\.crm\b|cinema\s*raw\s*light",
+        "confirmed": "Canon Cinema RAW Light",
+        "probable": "",
+        "gamut": "Canon Cinema Gamut / Log2 ou Log3",
+        "confidence": "Confirmé",
+        "method": "Flux Canon Cinema RAW Light (.CRM) détecté.",
+        "action": (
+            "Canon RAW : vérifier les réglages Camera RAW dans DaVinci Resolve "
+            "(Canon Log2 / Log3) selon le réglage de prise de vue."
+        ),
+    },
+    {
+        "id": "fujifilm_flog2",
+        "priority": 30,
+        "make_override": "Fujifilm",
+        "model_hint": "",
+        "match_regex": r"com\.fujifilm\.bt2020\.f-log2|f-log2|flog2",
+        "confirmed": "Fujifilm F-Log2",
+        "probable": "",
+        "gamut": "F-Gamut / BT.2020",
+        "confidence": "Confirmé",
+        "method": "Tag explicite Fujifilm F-Log2 détecté.",
+        "action": "CST : Input Color Space = Rec.2020 (ou F-Gamut), Input Gamma = Fujifilm F-Log2.",
+    },
+    {
+        "id": "fujifilm_flog",
+        "priority": 31,
+        "make_override": "Fujifilm",
+        "model_hint": "",
+        "match_regex": r"\bf-log\b|\bflog\b",
+        "confirmed": "",
+        "probable": "Fujifilm F-Log",
+        "gamut": "Fujifilm F-Gamut",
+        "confidence": "Probable",
+        "method": "Tag Fujifilm F-Log détecté.",
+        "action": "Proposition avec avertissement : vérifier F-Log / F-Gamut avant CST.",
+    },
+    {
+        "id": "panasonic_vlog",
+        "priority": 32,
+        "make_override": "Panasonic",
+        "model_hint": "",
+        "match_regex": r"\bv-log\b|\bvlog\b|v-gamut",
+        "confirmed": "",
+        "probable": "Panasonic V-Log",
+        "gamut": "V-Gamut",
+        "confidence": "Probable",
+        "method": "Tag Panasonic V-Log détecté (vérifier Video Range Full/Limited).",
+        "action": "Proposition avec avertissement : vérifier V-Log / V-Gamut et la plage vidéo.",
+    },
+    {
+        "id": "gopro_gplog",
+        "priority": 33,
+        "make_override": "GoPro",
+        "model_hint": "",
+        "match_regex": r"\bgp-log\b|\bgplog\b",
+        "confirmed": "GoPro GP-Log",
+        "probable": "",
+        "gamut": "GP-Log / BT.709 ou Wide",
+        "confidence": "Confirmé",
+        "method": "Tag GoPro GP-Log détecté.",
+        "action": "CST / LUT : appliquer le profil ou la LUT officielle GoPro GP-Log -> Rec.709 / DWG.",
+    },
+    {
+        "id": "gopro_flat_sdr",
+        "priority": 34,
+        "make_override": "GoPro",
+        "model_hint": "",
+        "match_regex": r"\bgopro\b",
+        "confirmed": "",
+        "probable": "GoPro Flat / SDR (BT.709)",
+        "gamut": "BT.709",
+        "confidence": "Probable",
+        "method": "Flux GoPro détecté sans tag GP-Log explicite.",
+        "action": "Proposition avec avertissement : vérifier Flat vs GoPro Color et plage Full/Limited.",
+    },
+]
+
+
+# ==================================================
+# BOUTON PERSONNALISÉ
+# ==================================================
+
 class RoundedButton(tk.Canvas):
-    """Bouton moderne avec coins arrondis et effet de survol."""
-    def __init__(self, parent, text, command=None, radius=16, padx=14, pady=6,
-                 bg="#2c313c", hover_bg="#3e4451", fg="#ffffff", canvas_bg="#181a1f", font=None):
+    def __init__(
+        self, parent, text, command=None, radius=16,
+        padx=14, pady=6, bg="#2c313c",
+        hover_bg="#3e4451", fg="#ffffff",
+        canvas_bg="#181a1f", font=None
+    ):
         self.font = font or (MONO_FONT, 9, "bold")
+        self.padx = padx
+        self.pady = pady
+
         tmp = tk.Label(parent, text=text, font=self.font)
         w = tmp.winfo_reqwidth() + padx * 2
         h = tmp.winfo_reqheight() + pady * 2
         tmp.destroy()
 
-        super().__init__(parent, width=w, height=h, bg=canvas_bg, highlightthickness=0, cursor="hand2")
+        super().__init__(
+            parent, width=w, height=h,
+            bg=canvas_bg, highlightthickness=0,
+            cursor="hand2"
+        )
+
         self.command = command
         self.radius = radius
         self.bg_normal = bg
         self.bg_hover = hover_bg
         self.fg_color = fg
         self.text_str = text
+        self._hovered = False
 
         self._draw(self.bg_normal)
-        self.bind("<Enter>", lambda e: self._draw(self.bg_hover))
-        self.bind("<Leave>", lambda e: self._draw(self.bg_normal))
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
         self.bind("<Button-1>", self._on_click)
+
+    def _on_enter(self, event=None):
+        self._hovered = True
+        self._draw(self.bg_hover)
+
+    def _on_leave(self, event=None):
+        self._hovered = False
+        self._draw(self.bg_normal)
 
     def _round_rect(self, x1, y1, x2, y2, r, **kwargs):
         pts = [
@@ -140,8 +301,16 @@ class RoundedButton(tk.Canvas):
     def _draw(self, fill_color):
         self.delete("all")
         w, h = int(self["width"]), int(self["height"])
-        self._round_rect(1, 1, w - 1, h - 1, self.radius, fill=fill_color, outline="")
-        self.create_text(w // 2, h // 2, text=self.text_str, fill=self.fg_color, font=self.font)
+        self._round_rect(
+            1, 1, w - 1, h - 1,
+            self.radius, fill=fill_color, outline=""
+        )
+        self.create_text(
+            w // 2, h // 2,
+            text=self.text_str,
+            fill=self.fg_color,
+            font=self.font
+        )
 
     def _on_click(self, event):
         if self.command:
@@ -149,15 +318,19 @@ class RoundedButton(tk.Canvas):
 
     def set_text(self, new_text):
         self.text_str = new_text
-        self._draw(self.bg_normal)
+        self._draw(self.bg_hover if self._hovered else self.bg_normal)
 
     def update_colors(self, bg, hover_bg, fg, canvas_bg):
         self.bg_normal = bg
         self.bg_hover = hover_bg
         self.fg_color = fg
         self.configure(bg=canvas_bg)
-        self._draw(self.bg_normal)
+        self._draw(self.bg_hover if self._hovered else self.bg_normal)
 
+
+# ==================================================
+# OUTILS MÉTADONNÉES GÉNÉRALES
+# ==================================================
 
 def norm(value):
     return re.sub(r"[^a-z0-9]+", "", str(value).lower())
@@ -167,9 +340,41 @@ def metadata_value(data, *names):
     for name in names:
         n = norm(name)
         for key, value in data.items():
-            if norm(key.split(":")[-1]) == n and value not in (None, "", []):
-                return ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+            full_key = norm(key)
+            short_key = norm(key.split(":")[-1])
+            if n in (full_key, short_key):
+                if value not in (None, "", []):
+                    return (
+                        ", ".join(map(str, value))
+                        if isinstance(value, list)
+                        else str(value)
+                    )
     return ""
+
+
+def collect_source_values(data, source_prefix, *names):
+    """Récupère les valeurs non vides d'une source donnée (MI:, XML:, ou ExifTool)."""
+    found = []
+    for name in names:
+        n = norm(name)
+        for key, value in data.items():
+            is_mi = key.startswith("MI:")
+            is_xml = key.startswith("XML:")
+            if source_prefix == "MI" and not is_mi:
+                continue
+            if source_prefix == "XML" and not is_xml:
+                continue
+            if source_prefix == "EXIF" and (is_mi or is_xml or key.startswith("_Analyse:")):
+                continue
+
+            short_key = norm(key.split(":")[-1])
+            full_key = norm(key)
+            if n in (short_key, full_key):
+                if value not in (None, "", []):
+                    txt = ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+                    if txt not in found:
+                        found.append(txt)
+    return found
 
 
 def all_values(data, patterns):
@@ -189,35 +394,47 @@ DJI_NAME = re.compile(r"^DJI_\d{14}_\d{4}", re.I)
 def looks_dji(path, data):
     if path and DJI_NAME.match(Path(path).name):
         return True
+
     for key, value in data.items():
         if key == "SourceFile" or key.split(":")[0] in ("File", "System"):
             continue
         if "dji" in key.lower() or "dji" in str(value).lower():
             return True
+
     return False
 
 
+# ==================================================
+# SIDECAR XML (SONY / CANON)
+# ==================================================
+
 def find_sidecar_xml(video_path):
     p = Path(video_path)
+
     candidates = [
         p.with_suffix(".XML"),
         p.with_suffix(".xml"),
         p.parent / f"{p.stem}M01.XML",
         p.parent / f"{p.stem}M01.xml",
     ]
+
     for c in candidates:
         if c.is_file():
             return c
+
     return None
 
 
-def parse_sony_xml(xml_path):
+def parse_sidecar_xml(xml_path):
     extracted = {}
+
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
+
         for elem in root.iter():
             tag = elem.tag.split("}")[-1]
+
             if tag == "Device":
                 manuf = elem.attrib.get("manufacturer", "")
                 model = elem.attrib.get("modelName", "")
@@ -225,26 +442,42 @@ def parse_sony_xml(xml_path):
                     extracted["XML:Make"] = manuf
                 if model:
                     extracted["XML:Model"] = model
+
             elif tag == "Item":
                 name = elem.attrib.get("name", "")
                 val = elem.attrib.get("value", "")
                 if name and val:
                     extracted[f"XML:{name}"] = val
+
             elif tag == "VideoFrame":
                 for attr in ("videoCodec", "captureFps", "formatFps"):
                     if attr in elem.attrib:
                         extracted[f"XML:{attr}"] = elem.attrib[attr]
+
+            elif elem.text and elem.text.strip() and len(list(elem)) == 0:
+                t_low = tag.lower()
+                if any(k in t_low for k in ("gamma", "color", "transfer", "model", "make", "log")):
+                    key_name = f"XML:{tag}"
+                    if key_name not in extracted:
+                        extracted[key_name] = elem.text.strip()
+
     except Exception as e:
         extracted["XML:Error"] = str(e)
+
     return extracted
 
 
+# ==================================================
+# EXIFTOOL
+# ==================================================
+
 def _exiftool_usable(p):
-    """Windows : le exiftool.exe de ~58 Ko n'est qu'un lanceur et exige le dossier exiftool_files a cote.
-    macOS/Linux : le script (ou binaire) doit etre executable."""
     try:
         if p.suffix.lower() == ".exe":
-            return (p.parent / "exiftool_files").is_dir() or p.stat().st_size > 1_000_000
+            return (
+                (p.parent / "exiftool_files").is_dir()
+                or p.stat().st_size > 1_000_000
+            )
         return os.access(str(p), os.X_OK)
     except OSError:
         return False
@@ -254,25 +487,33 @@ def find_exiftool():
     base_dir = Path(__file__).resolve().parent
     names = ("exiftool.exe",) if os.name == "nt" else ("exiftool",)
     candidates = []
+
     for n in names:
-        candidates += [base_dir / n, Path.cwd() / n, Path(sys.executable).parent / n]
-    # Cherche aussi dans d'eventuels sous-dossiers exiftool-* locaux ou dans Telechargements
+        candidates += [
+            base_dir / n,
+            Path.cwd() / n,
+            Path(sys.executable).parent / n
+        ]
+
     for folder in (base_dir, Path.home() / "Downloads"):
         if folder.is_dir():
             for n in names:
                 candidates.extend(folder.glob(f"*xif*ool*/{n}"))
+
     if os.name != "nt":
-        # Une app lancee hors terminal n'a pas toujours /opt/homebrew/bin dans son PATH
-        candidates += [Path("/opt/homebrew/bin/exiftool"), Path("/usr/local/bin/exiftool")]
+        candidates += [
+            Path("/opt/homebrew/bin/exiftool"),
+            Path("/usr/local/bin/exiftool")
+        ]
 
     for p in candidates:
         if p.is_file() and _exiftool_usable(p):
             return str(p)
+
     return shutil.which("exiftool") or shutil.which("exiftool.exe")
 
 
 def mxf_camera_identity(data):
-    """Recupere les champs d'identite MXF en conservant leur groupe CopyN."""
     groups = {}
     wanted = {
         "applicationsuppliername",
@@ -308,789 +549,150 @@ def mxf_camera_identity(data):
     return "", "", ""
 
 
-def identify(data, path=None):
-    make = metadata_value(data, "XML:Make", "Make", "Manufacturer", "CameraManufacturer")
-    model = metadata_value(data, "XML:Model", "Model", "CameraModelName", "CameraModel", "AppleProappsModelname")
-    mxf_supplier, mxf_application, mxf_version = mxf_camera_identity(data)
+# ==================================================
+# DÉCODEUR NATIF ARRI MXF
+# ==================================================
 
-    # Les champs Application* du MXF peuvent identifier le fabricant et le modele.
-    if mxf_supplier and "arri" in mxf_supplier.lower():
-        make = "ARRI"
-    if mxf_application and re.search(r"alexa|amira", mxf_application, re.I):
-        model = mxf_application.strip()
-        if not model.lower().startswith("arri"):
-            model = "ARRI " + model
+ARRI_SET_KEYS = {
+    "position": bytes.fromhex(
+        "06 0E 2B 34 02 01 01 01 0E 17 01 02 0C 00 00 00"
+    ),
+    "lens": bytes.fromhex(
+        "06 0E 2B 34 02 01 01 01 0E 17 01 02 0D 00 00 00"
+    ),
+    "capture": bytes.fromhex(
+        "06 0E 2B 34 02 01 01 01 0E 17 01 02 0E 00 00 00"
+    ),
+}
 
-    dji = looks_dji(path, data)
+ARRI_FIELD_KEYS = {
+    "tilt": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0C 03 00 00",
+    "roll": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0C 04 00 00",
+    "focus_metric": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0D 01 00 00",
+    "focus_imperial": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0D 02 00 00",
+    "iris": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0D 03 00 00",
+    "entrance_pupil": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0D 04 00 00",
+    "focal_nominal": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0D 05 00 00",
+    "focal_effective": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0D 06 00 00",
+    "exposure_time": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0E 01 00 00",
+    "averaged_frames": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0E 02 00 00",
+    "ei": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0E 03 00 00",
+    "nd_index": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0E 04 00 00",
+    "white_balance": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0E 05 00 00",
+    "tint": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0E 06 00 00",
+    "sensor_rate": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0E 07 00 00",
+    "nd_density": "06 0E 2B 34 01 01 01 0E 0E 17 01 02 0E 08 00 00",
+}
 
-    if dji and not make:
-        make = "DJI"
+ARRI_FIELD_KEYS = {
+    name: bytes.fromhex(value)
+    for name, value in ARRI_FIELD_KEYS.items()
+}
 
-    if dji and (not model or model.startswith("FC")):
-        enc = metadata_value(data, "Encoder")
-        if enc and "dji" in enc.lower():
-            model = enc
-        if not model:
-            cat = metadata_value(data, "Category")
-            m_code = re.search(r"model_name:([^;]+)", cat)
-            if m_code:
-                code = m_code.group(1).strip()
-                model = DJI_MODELS.get(code, f"DJI ({code})")
-        if not model:
-            for k, v in data.items():
-                if k.startswith("Protobuf:") and isinstance(v, str) and v.startswith("DJI ") and not v.startswith("DJI FC"):
-                    model = v
-                    break
+ARRI_CHUNK_SIZE = 16 * 1024 * 1024
+ARRI_OVERLAP = 32
 
-    primaries = metadata_value(data, "MI:colour_primaries", "ColorPrimaries", "Primaries")
-    transfer = metadata_value(data, "MI:transfer_characteristics", "TransferCharacteristics", "TransferFunction")
-    matrix = metadata_value(data, "MI:matrix_coefficients", "MatrixCoefficients")
-    codec = metadata_value(data, "MI:format", "CompressorID", "CodecID", "VideoCodec")
-    format_profile = metadata_value(data, "MI:format_profile")
-    bitdepth = metadata_value(data, "MI:bit_depth", "BitDepth", "BitsPerSample")
-    chroma = metadata_value(data, "MI:chroma_subsampling", "ChromaSubsampling")
-    width = metadata_value(data, "MI:width", "ImageWidth", "SourceImageWidth")
-    height = metadata_value(data, "MI:height", "ImageHeight", "SourceImageHeight")
-    fps = metadata_value(data, "MI:frame_rate", "VideoFrameRate", "FrameRate")
 
-    tags = []
-    for key, value in data.items():
-        if key == "SourceFile" or key.split(":")[0] in ("File", "System", "ExifTool"):
-            continue
-        if isinstance(value, (str, int, float)):
-            tags.append(f"{key}={value}")
-    tagtext = " ".join(tags).lower()
-    # Le nom de fichier peut aider a reconnaitre une famille de camera,
-    # mais ne doit jamais servir de preuve pour un profil Log ou un codec RAW.
-    filename_text = Path(path).name.lower() if path else ""
-    arri_identity_text = " ".join((make, model, mxf_supplier, mxf_application, tagtext)).lower()
-    arri_detected = (
-        "arri" in arri_identity_text
-        or bool(re.search(r"\balexa\b|\bamira\b", arri_identity_text))
-        or bool(re.search(r"arri|alexa|amira", filename_text))
-    )
+def arri_read_ber(data, position):
+    if position >= len(data):
+        return None
+    first = data[position]
+    if first < 0x80:
+        return first, 1
+    count = first & 0x7F
+    if count == 0 or count > 8:
+        return None
+    end = position + 1 + count
+    if end > len(data):
+        return None
+    length = int.from_bytes(data[position + 1:end], "big")
+    return length, count + 1
 
-    if arri_detected and (not model or model == "Modele non identifie"):
-        model_source = arri_identity_text + " " + filename_text
-        arri_models = (
-            (r"alexa\s*35", "ARRI ALEXA 35"),
-            (r"alexa\s*mini\s*lf", "ARRI ALEXA Mini LF"),
-            (r"alexa\s*lf", "ARRI ALEXA LF"),
-            (r"alexa\s*65", "ARRI ALEXA 65"),
-            (r"alexa\s*mini", "ARRI ALEXA Mini"),
-            (r"\bamira\b", "ARRI AMIRA"),
-            (r"alexa", "ARRI ALEXA (modele a preciser)"),
-        )
-        for pattern, label in arri_models:
-            if re.search(pattern, model_source, re.I):
-                model = label
+
+def arri_parse_klv(data):
+    result = {}
+    position = 0
+    while position + 17 <= len(data):
+        key = data[position:position + 16]
+        ber = arri_read_ber(data, position + 16)
+        if ber is None:
+            break
+        length, ber_size = ber
+        value_start = position + 16 + ber_size
+        value_end = value_start + length
+        if value_end > len(data):
+            break
+        result[key] = data[value_start:value_end]
+        position = value_end
+    return result
+
+
+def arri_find_packets(path, progress_callback=None):
+    hits = []
+    position = 0
+    overlap = b""
+    file_size = path.stat().st_size
+    search_key = ARRI_SET_KEYS["position"]
+
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(ARRI_CHUNK_SIZE)
+            if not chunk:
                 break
-
-    profile = ""
-    gamut = ""
-    confidence = "Indetermine"
-    method = "Aucun tag de profil Log suffisamment explicite detecte."
-    action = "Ne pas appliquer de CST camera au hasard. Verifier le menu image de la camera ou tester visuellement la courbe."
-
-    if arri_detected:
-        # Ces detections proviennent exclusivement des metadonnees, jamais du nom du fichier.
-        logc4_explicit = bool(re.search(r"log\s*c\s*4|logc4", tagtext, re.I))
-        logc3_explicit = bool(re.search(r"log\s*c\s*3|logc3", tagtext, re.I))
-        awg4_explicit = bool(re.search(r"arri\s*wide\s*gamut\s*4|awg4", tagtext, re.I))
-        awg3_explicit = bool(re.search(r"arri\s*wide\s*gamut\s*3|awg3", tagtext, re.I))
-        is_arriraw = bool(re.search(r"arriraw|arri\s*raw", tagtext, re.I))
-
-        if not make or "non identifie" in make.lower():
-            make = "ARRI"
-
-        if logc4_explicit:
-            profile = "ARRI LogC4"
-            confidence = "Confirme"
-        elif logc3_explicit:
-            profile = "ARRI LogC3"
-            confidence = "Confirme"
-        elif re.search(r"alexa\s*35|alexa\s*mini\s*lf|alexa\s*lf|alexa\s*65", model, re.I):
-            profile = "ARRI LogC4 (probable - a verifier dans Camera RAW)"
-            confidence = "Probable"
-        elif "alexa" in model.lower() or "amira" in model.lower():
-            profile = "ARRI LogC (generation a confirmer)"
-            confidence = "Probable"
-
-        if awg4_explicit:
-            gamut = "ARRI Wide Gamut 4"
-        elif awg3_explicit:
-            gamut = "ARRI Wide Gamut 3"
-        elif "logc4" in profile.lower():
-            gamut = "ARRI Wide Gamut 4 (probable - a verifier)"
-        elif "logc3" in profile.lower():
-            gamut = "ARRI Wide Gamut 3 (probable - a verifier)"
-        elif profile:
-            gamut = "Gamut ARRI a confirmer"
-
-        if is_arriraw:
-            method = "Tag ARRIRAW trouve dans les metadonnees. "
-        elif profile:
-            method = "Profil ARRI identifie a partir des metadonnees. "
-        else:
-            method = "Camera ARRI identifiee, mais aucun tag de courbe Log explicite trouve. "
-
-        if mxf_application:
-            method += (
-                f"Identite MXF : {mxf_supplier or 'fournisseur non renseigne'} / "
-                f"{mxf_application}"
-                + (f" ({mxf_version})" if mxf_version else "")
-                + ". "
-            )
-        elif "arri" not in arri_identity_text:
-            method += "Identification a partir du nom de fichier uniquement : a confirmer. "
-
-        if is_arriraw:
-            action = (
-                "Dans DaVinci Resolve, verifier d'abord les reglages Camera RAW / Decode Using. "
-                "Choisir le debayering et l'espace/gamma de developpement souhaites. "
-                "Si le RAW est developpe directement en LogC4 / AWG4 dans Resolve, ne pas ajouter "
-                "un second CST d'entree. Si le fichier a deja ete debayerise/exporte, verifier "
-                "les valeurs de sortie avant de choisir un CST."
-            )
-        elif profile:
-            action = (
-                "Verifier le gamma et le gamut de developpement dans les reglages Camera RAW "
-                "ou dans les metadonnees du fichier. Pour un signal LogC4 / AWG4 confirme : "
-                "CST Input Color Space = ARRI Wide Gamut 4, Input Gamma = ARRI LogC4, "
-                "Output = DaVinci Wide Gamut / DaVinci Intermediate. Ne pas appliquer ce CST "
-                "si le RAW est deja developpe dans un autre espace."
-            )
-        else:
-            action = (
-                "Ne pas appliquer de CST ARRI sans connaitre le developpement du fichier. "
-                "Verifier les reglages Camera RAW et les informations de gamma/gamut du media."
-            )
-
-        if not (logc4_explicit or logc3_explicit or awg4_explicit or awg3_explicit or is_arriraw):
-            if "arri" not in arri_identity_text:
-                method += "Le nom de fichier est un indice, pas une preuve des reglages d'enregistrement."
-
-    sony_gamma = metadata_value(data, "XML:CaptureGammaEquation")
-    sony_prim = metadata_value(data, "XML:CaptureColorPrimaries")
-    if sony_gamma or "sony" in make.lower() or "xavc" in tagtext:
-        if not make:
-            make = "Sony"
-        sg = (sony_gamma or tagtext).lower()
-        sp = (sony_prim or tagtext).lower()
-
-        if "s-log3" in sg or "slog3" in sg:
-            profile = "Sony S-Log3"
-            if "cine" in sp:
-                gamut = "S-Gamut3.Cine"
-            elif "s-gamut3" in sp or "sgamut3" in sp:
-                gamut = "S-Gamut3"
-            else:
-                gamut = "S-Gamut3.Cine (probable - a verifier)"
-            confidence = "Confirme" if sony_gamma else "Probable"
-            method = f"Metadonnees Sony ({'Fichier Sidecar XML' if sony_gamma else 'Tags MP4'}) : {sony_gamma} / {sony_prim}".strip(" /")
-            clean_gamut = gamut.split(" (")[0]
-            action = f"CST DaVinci Resolve : Input Color Space = {clean_gamut}, Input Gamma = Sony S-Log3 -> Output = DaVinci Wide Gamut / DaVinci Intermediate."
-        elif "s-log2" in sg or "slog2" in sg:
-            profile = "Sony S-Log2"
-            gamut = "S-Gamut"
-            confidence = "Confirme" if sony_gamma else "Probable"
-            method = "Indication Sony S-Log2 detectee."
-            action = "CST DaVinci Resolve : Input Color Space = S-Gamut, Input Gamma = Sony S-Log2 -> DaVinci Wide Gamut / Intermediate."
-        elif "rec709" in sg or "itu709" in sg or "s-cinetone" in sg:
-            profile = "Sony S-Cinetone / Rec.709" if "cinetone" in sg else "Sony Rec.709 (Standard / PP Off)"
-            gamut = "Rec.709"
-            confidence = "Confirme" if sony_gamma else "Probable"
-            method = f"XML Sony CaptureGammaEquation = {sony_gamma}" if sony_gamma else "Profil standard Sony detecte."
-            action = "Signal deja en Rec.709 : pas de CST Log necessaire (ou CST Rec.709 -> DaVinci Wide Gamut si workflow DWG)."
-
-    if dji and not profile:
-        is_10bit = str(bitdepth) == "10" or "10" in str(format_profile)
-        if "d-log m" in tagtext or "d-logm" in tagtext or "dlogm" in tagtext:
-            profile = "DJI D-Log M"
-            gamut = "Rec.709 (Encodage D-Log M)"
-            confidence = "Confirme"
-            method = "Tag explicite DJI D-Log M."
-            action = "Utiliser la LUT officielle DJI D-Log M -> Rec.709 specifique au modele (" + (model or "DJI") + "). Ne pas utiliser de CST D-Log/D-Gamut classique."
-        elif "d-log" in tagtext or "dlog" in tagtext:
-            profile = "DJI D-Log"
-            gamut = "DJI D-Gamut"
-            confidence = "Confirme"
-            method = "Tag explicite DJI D-Log."
-            action = "CST DaVinci Resolve : Input Color Space = DJI D-Gamut, Input Gamma = DJI D-Log -> DaVinci Wide Gamut / Intermediate."
-        elif "hlg" in tagtext or "arib-std-b67" in tagtext:
-            profile = "DJI HLG (HDR)"
-            gamut = "BT.2020"
-            confidence = "Confirme"
-            method = "Courbe de transfert HLG detectee."
-            action = "CST DaVinci Resolve : Input Color Space = Rec.2020, Input Gamma = Rec.2100 HLG."
-        elif is_10bit:
-            profile = "DJI D-Log M (Tres probable - Video 10-bit)"
-            gamut = "Rec.709 (Conteneur)"
-            confidence = "Probable"
-            method = f"Drone DJI encode en {bitdepth}-bit ({format_profile or codec}) sans tag HLG : sur DJI recent, le 10-bit correspond quasi systematiquement au mode D-Log M."
-            action = f"Si l'image est plate/desaturee : appliquer la LUT officielle DJI [{model or 'Modele DJI'}] D-Log M to Rec.709. (Si l'image est deja contrastee, traiter en Rec.709)."
-        else:
-            profile = "DJI Normal (Rec.709)"
-            gamut = "Rec.709"
-            confidence = "Confirme"
-            method = f"Drone DJI encode en {bitdepth or '8'}-bit avec flags BT.709 : le D-Log / D-Log M n'est pas disponible en 8-bit sur ces modeles."
-            action = "Signal Rec.709 standard : aucun CST Log requis (ou CST Rec.709 -> DaVinci Wide Gamut / Intermediate)."
-
-    if not profile:
-        if "canonlogversion" in tagtext or re.search(r"canon.?log.?3|clog.?3", tagtext):
-            profile = "Canon Log 3"
-            gamut = "Cinema Gamut / BT.709 (verifier ColorSpace2)"
-            confidence = "Confirme"
-            method = "Tag Canon Log 3 detecte."
-            action = "CST : Input Gamma = Canon Log 3, Input Color Space = Canon Cinema Gamut (ou Rec.709 selon reglage boitier)."
-        elif "com.fujifilm.bt2020.f-log2" in tagtext or "f-log2" in tagtext:
-            profile = "Fujifilm F-Log2"
-            gamut = "F-Gamut / BT.2020"
-            confidence = "Confirme"
-            method = "Tag Fujifilm F-Log2 detecte."
-            action = "CST : Input Color Space = Rec.2020 (ou Fujifilm F-Gamut), Input Gamma = Fujifilm F-Log2."
-        elif "f-log" in tagtext:
-            profile = "Fujifilm F-Log"
-            gamut = "Fujifilm F-Gamut"
-            confidence = "Probable"
-            method = "Tag Fujifilm F-Log detecte."
-            action = "CST : Input Color Space = Fujifilm F-Gamut, Input Gamma = Fujifilm F-Log."
-        elif "v-log" in tagtext or "vlog" in tagtext:
-            profile = "Panasonic V-Log"
-            gamut = "V-Gamut"
-            confidence = "Probable"
-            method = "Tag Panasonic V-Log detecte."
-            action = "CST : Input Color Space = Panasonic V-Gamut, Input Gamma = Panasonic V-Log."
-        elif "apple log" in tagtext or "applelog" in tagtext:
-            profile = "Apple Log"
-            gamut = "Rec.2020"
-            confidence = "Confirme"
-            method = "Tag Apple Log detecte."
-            action = "CST : Input Color Space = Rec.2020, Input Gamma = Apple Log."
-        elif "hlg" in tagtext or "arib-std-b67" in tagtext:
-            profile = "HLG (HDR)"
-            gamut = "Rec.2020"
-            confidence = "Probable"
-            method = "Transfert HLG detecte."
-            action = "CST : Input Color Space = Rec.2020, Input Gamma = Rec.2100 HLG."
-
-    if not model:
-        model = "Modele non identifie"
-    if not make:
-        make = "Fabricant non identifie"
-
-    tech_bit = f"{bitdepth} bits" if bitdepth and "bit" not in str(bitdepth).lower() else (bitdepth or "Non renseigne")
-    if chroma:
-        tech_bit += f" ({chroma})"
-
-    return {
-        "make": make,
-        "model": model,
-        "profile": profile or "Non identifie",
-        "gamut": gamut or "Non identifie",
-        "confidence": confidence,
-        "method": method,
-        "action": action,
-        "primaries": primaries or "Non renseigne",
-        "transfer": transfer or "Non renseigne",
-        "matrix": matrix or "Non renseigne",
-        "codec": f"{codec} ({format_profile})" if codec and format_profile else (codec or "Non renseigne"),
-        "bitdepth": tech_bit,
-        "resolution": (f"{width} x {height}" if width and height else "Non renseignee"),
-        "fps": fps or "Non renseignee",
-        "xml_found": "Oui (" + Path(data["_Analyse:XMLPath"]).name + ")" if data.get("_Analyse:XMLPath") else "Non"
-    }
-
-
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title(f"Analyse Camera - V{APP_VERSION} (ExifTool + MediaInfo + XML + Export CSV)")
-        self.root.geometry("1220x800")
-        self.root.minsize(920, 640)
-        self.files = []
-        self.results = []
-        self.index = 0
-        self.q = queue.Queue()
-        self.busy = False
-        self.cache = {}
-        self.theme_name = "dark"
-
-        self.exiftool = find_exiftool()
-
-        self._build()
-        self.apply_theme("dark")
-        self.root.after(100, self._poll)
-        try:
-            from tkinterdnd2 import DND_FILES
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind("<<Drop>>", self._drop)
-            self.drop_enabled = True
-        except Exception:
-            self.drop_enabled = False
-            self.drop_label.config(text="Glisser-depose des videos ou dossiers ici (lance via le fichier .command ou .BAT pour activer le glisser-deposer)")
-        self._show_status()
-
-    def _build(self):
-        self.style = ttk.Style()
-        if "clam" in self.style.theme_names():
-            self.style.theme_use("clam")
-
-        self.buttons = []
-        self.top = ttk.Frame(self.root, padding=10)
-        self.top.pack(fill="x")
-
-        btn_specs = [
-            ("Importer videos...", self.pick),
-            ("Importer dossier...", self.pick_folder),
-            ("Reanalyser", lambda: self.analyze(force=True)),
-            ("Copier rapport", self.copy_report),
-            ("Exporter CSV...", self.export_csv),
-            ("JSON...", self.export_dump),
-        ]
-        for label, cmd in btn_specs:
-            b = RoundedButton(self.top, text=label, command=cmd)
-            b.pack(side="left", padx=(0, 6))
-            self.buttons.append(b)
-
-        self.theme_btn = RoundedButton(self.top, text="Mode Clair", command=self.toggle_theme)
-        self.theme_btn.pack(side="right", padx=(12, 0))
-        self.buttons.append(self.theme_btn)
-
-        self.status = ttk.Label(self.top, text="Pret", font=(MONO_FONT, 9))
-        self.status.pack(side="right")
-
-        self.drop_label = tk.Label(
-            self.root,
-            text="[ Glisse-depose tes videos ou dossiers de rushs (DJI, Sony, Canon...) ici ]",
-            anchor="center", pady=10, font=(MONO_FONT, 9, "bold")
-        )
-        self.drop_label.pack(fill="x", padx=10, pady=(0, 8))
-
-        self.body = ttk.Panedwindow(self.root, orient="horizontal")
-        self.body.pack(fill="both", expand=True, padx=10, pady=5)
-
-        left = ttk.Frame(self.body, padding=5)
-        self.body.add(left, weight=1)
-        ttk.Label(left, text="FICHIERS ANALYSES", font=(MONO_FONT, 10, "bold")).pack(anchor="w")
-        self.listbox = tk.Listbox(left, width=36, activestyle="dotbox", borderwidth=1, highlightthickness=0, font=(MONO_FONT, 9))
-        self.listbox.pack(fill="both", expand=True, pady=5)
-        self.listbox.bind("<<ListboxSelect>>", self._select)
-
-        right = ttk.Frame(self.body, padding=8)
-        self.body.add(right, weight=4)
-        self.heading = ttk.Label(right, text="Aucun fichier charge", font=(MONO_FONT, 13, "bold"), wraplength=780)
-        self.heading.pack(anchor="w", pady=(0, 8))
-
-        self.summary = tk.Text(right, height=13, wrap="word", font=(MONO_FONT, 10), relief="flat", padx=12, pady=10, borderwidth=1)
-        self.summary.pack(fill="x", pady=4)
-
-        ttk.Label(right, text="METADONNEES TECHNIQUES & TAGS DETECTES", font=(MONO_FONT, 10, "bold")).pack(anchor="w", pady=(8, 2))
-        self.details = tk.Text(right, wrap="none", font=(MONO_FONT, 9), relief="flat", padx=12, pady=10, borderwidth=1)
-        self.details.pack(fill="both", expand=True)
-
-        nav = ttk.Frame(right)
-        nav.pack(fill="x", pady=8)
-        b_prev = RoundedButton(nav, text="< Precedent", command=lambda: self.navigate(-1), radius=12, padx=12, pady=4)
-        b_prev.pack(side="left")
-        b_next = RoundedButton(nav, text="Suivant >", command=lambda: self.navigate(1), radius=12, padx=12, pady=4)
-        b_next.pack(side="left", padx=6)
-        self.buttons.extend([b_prev, b_next])
-
-        self.counter = ttk.Label(nav, text="0 / 0", font=(MONO_FONT, 9, "bold"))
-        self.counter.pack(side="right")
-
-    def toggle_theme(self):
-        new_theme = "light" if self.theme_name == "dark" else "dark"
-        self.apply_theme(new_theme)
-        if self.results and self.results[self.index] is not None:
-            self.show(self.index)
-
-    def apply_theme(self, name):
-        self.theme_name = name
-        t = THEMES[name]
-        self.theme_btn.set_text("Mode Clair" if name == "dark" else "Mode Sombre")
-
-        self.root.configure(bg=t["bg"])
-        self.style.configure("TFrame", background=t["bg"])
-        self.style.configure("TPanedwindow", background=t["bg"])
-        self.style.configure("TLabel", background=t["bg"], foreground=t["fg"], font=(MONO_FONT, 9))
-
-        btn_bg = "#2c313c" if name == "dark" else "#e1e4e8"
-        btn_hover = "#3e4451" if name == "dark" else "#d1d5da"
-        for b in getattr(self, "buttons", []):
-            b.update_colors(bg=btn_bg, hover_bg=btn_hover, fg=t["fg_bright"], canvas_bg=t["bg"])
-
-        self.drop_label.config(bg=t["drop_bg"], fg=t["drop_fg"])
-        self.listbox.config(bg=t["panel"], fg=t["fg"], selectbackground=t["select_bg"], selectforeground=t["select_fg"])
-        self.summary.config(bg=t["text_bg"], fg=t["fg"], insertbackground=t["fg_bright"], highlightbackground=t["border"])
-        self.details.config(bg=t["text_bg"], fg=t["fg"], insertbackground=t["fg_bright"], highlightbackground=t["border"])
-
-        for widget in (self.summary, self.details):
-            sz = 10 if widget == self.summary else 9
-            widget.tag_configure("label", foreground=t["label"], font=(MONO_FONT, sz, "bold") if widget == self.summary else (MONO_FONT, sz))
-            widget.tag_configure("camera", foreground=t["camera"], font=(MONO_FONT, sz, "bold"))
-            widget.tag_configure("log", foreground=t["log"], font=(MONO_FONT, sz, "bold"))
-            widget.tag_configure("rec709", foreground=t["rec709"], font=(MONO_FONT, sz, "bold"))
-            widget.tag_configure("ok", foreground=t["ok"], font=(MONO_FONT, sz, "bold"))
-            widget.tag_configure("warn", foreground=t["warn"], font=(MONO_FONT, sz, "bold"))
-            widget.tag_configure("err", foreground=t["err"], font=(MONO_FONT, sz, "bold"))
-            widget.tag_configure("cst_title", foreground=t["cst"], font=(MONO_FONT, sz, "bold"))
-            widget.tag_configure("cst_body", foreground=t["fg_bright"], font=(MONO_FONT, sz))
-            widget.tag_configure("xml_tag", foreground=t["xml_tag"], font=(MONO_FONT, sz))
-            widget.tag_configure("mi_tag", foreground=t["mi_tag"], font=(MONO_FONT, sz))
-            widget.tag_configure("exif_tag", foreground=t["exif_tag"], font=(MONO_FONT, sz))
-            widget.tag_configure("val_normal", foreground=t["fg_bright"], font=(MONO_FONT, sz))
-
-
-
-    def _show_status(self):
-        et_txt = "ExifTool OK" if self.exiftool else "ExifTool MANQUANT"
-        mi_txt = "MediaInfo OK" if HAS_PYMEDIAINFO else "pymediainfo manquant"
-        self.status.config(text=f"{et_txt}  |  {mi_txt}")
-
-    def pick(self):
-        paths = filedialog.askopenfilenames(title="Choisir des fichiers video", filetypes=[
-            ("Videos", "*.mov *.mp4 *.mxf *.mkv *.avi *.mts *.m2ts *.braw *.r3d *.crm *.ari *.mpg *.m4v"),
-            ("Tous les fichiers", "*.*")])
-        if paths:
-            self.add_files(paths)
-
-    def pick_folder(self):
-        folder = filedialog.askdirectory(title="Choisir un dossier de rushs (scan recursif)")
-        if folder:
-            self.add_files([folder])
-
-    def _drop(self, event):
-        try:
-            paths = self.root.tk.splitlist(event.data)
-            self.add_files(paths)
-        except Exception as e:
-            messagebox.showerror("Glisser-deposer", str(e))
-
-    def add_files(self, paths):
-        added = []
-        for raw_p in paths:
-            p = Path(raw_p)
-            if p.is_file():
-                added.append(str(p))
-            elif p.is_dir():
-                for child in sorted(p.rglob("*")):
-                    if child.is_file() and child.suffix.lower() in VIDEO_EXTS:
-                        added.append(str(child))
-        if not added:
-            messagebox.showinfo("Aucune video", "Aucun fichier video compatible trouve dans la selection.")
-            return
-        seen = set(self.files)
-        self.files.extend(p for p in added if p not in seen)
-        self.listbox.delete(0, "end")
-        for p in self.files:
-            self.listbox.insert("end", Path(p).name)
-        self.analyze()
-
-    def analyze(self, force=False):
-        if self.busy:
-            return
-        if force:
-            self.cache.clear()
-        if not self.files:
-            self.pick()
-            return
-        if not self.exiftool:
-            messagebox.showerror("ExifTool requis", "ExifTool est introuvable. Fermez l’application puis relancez le lanceur Analyse Camera (.command sur Mac, .bat sur Windows) pour terminer son installation.")
-            return
-        self.busy = True
-        self.status.config(text="Analyse en cours...")
-        self.results = [None] * len(self.files)
-        threading.Thread(target=self._worker, daemon=True).start()
-
-    def _run_exiftool(self, path, deep=False):
-        import tempfile
-        args = ["-json", "-G0:1:2:3", "-a", "-u"]
-        if deep:
-            args.append("-ee")
-        args.extend(["-api", "RequestAll=3", "-charset", "filename=UTF8", str(path)])
-
-        # Ecrit les arguments dans un fichier UTF-8 pour eviter la corruption des accents (ex: Côte Brune) sous Windows
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8", delete=False) as tf:
-            tf.write("\n".join(args))
-            argfile = tf.name
-
-        try:
-            cmd = [self.exiftool, "-@", argfile]
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=300 if deep else 180,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
-        finally:
-            try:
-                os.remove(argfile)
-            except OSError:
-                pass
-
-        out = (proc.stdout or "").strip()
-        if not out:
-            raise RuntimeError(proc.stderr.strip() or f"ExifTool n'a renvoye aucune donnee (code {proc.returncode}).")
-        parsed = json.loads(out)
-        data = parsed[0] if parsed else {}
-        return {k: v for k, v in data.items() if not re.search(r":Doc(?:[2-9]|\d{2,}):", k)}
-
-    def _run_mediainfo(self, path):
-        if not HAS_PYMEDIAINFO:
-            return {}
-        try:
-            mi = MediaInfo.parse(path)
-            mi_data = {}
-            for track in mi.tracks:
-                if track.track_type == "Video":
-                    for k, v in track.to_data().items():
-                        if v not in (None, "", []) and isinstance(v, (str, int, float)):
-                            mi_data[f"MI:{k}"] = v
-                    break
-            return mi_data
-        except Exception:
-            return {}
-    def _worker(self):
-        for i, path in enumerate(self.files):
-            try:
-                if path in self.cache:
-                    self.q.put(("result", i, path, self.cache[path], None))
-                    continue
-
-                data = self._run_exiftool(path, deep=DEEP_SCAN)
-
-                if not DEEP_SCAN and looks_dji(path, data):
-                    try:
-                        d2 = self._run_exiftool(path, deep=True)
-                        d2["_Analyse:DeepPass"] = "ee"
-                        data = d2
-                    except Exception:
-                        pass
-
-                mi_data = self._run_mediainfo(path)
-                data.update(mi_data)
-
-                xml_file = find_sidecar_xml(path)
-                if xml_file:
-                    data["_Analyse:XMLPath"] = str(xml_file)
-                    data.update(parse_sony_xml(xml_file))
-
-                self.cache[path] = data
-                self.q.put(("result", i, path, data, None))
-            except Exception as e:
-                self.q.put(("result", i, path, {}, str(e)))
-        self.q.put(("done",))
-
-    def _poll(self):
-        try:
+            data = overlap + chunk
+            base = position - len(overlap)
+            start = 0
             while True:
-                item = self.q.get_nowait()
-                if item[0] == "result":
-                    _, i, path, data, error = item
-                    self.results[i] = {"path": path, "data": data, "error": error, "info": identify(data, path) if (data and not error) else None}
-                    self.listbox.delete(i)
-                    self.listbox.insert(i, Path(path).name + ("  [ERR]" if error else ""))
-                    self.status.config(text=f"Analyse {i+1}/{len(self.files)}")
-                elif item[0] == "done":
-                    self.busy = False
-                    self._show_status()
-                    if self.results:
-                        self.show(self.index if self.index < len(self.results) else 0)
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll)
+                index = data.find(search_key, start)
+                if index < 0:
+                    break
+                absolute = base + index
+                packet_offset = absolute - 20
+                if packet_offset >= 0:
+                    hits.append(packet_offset)
+                start = index + 1
+            overlap = data[-ARRI_OVERLAP:]
+            position += len(chunk)
+            if progress_callback and file_size:
+                progress_callback(min(position / file_size * 100, 100))
 
-    def _select(self, event=None):
-        sel = self.listbox.curselection()
-        if sel:
-            self.show(sel[0])
-
-    def navigate(self, step):
-        if not self.results:
-            return
-        self.show(max(0, min(len(self.results) - 1, self.index + step)))
-
-    def _insert_kv(self, widget, label, value, val_tag="val_normal", suffix="\n"):
-        widget.insert("end", label, "label")
-        widget.insert("end", value + suffix, val_tag)
-
-    def show(self, i):
-        if i >= len(self.results) or self.results[i] is None:
-            return
-        self.index = i
-        self.listbox.selection_clear(0, "end")
-        self.listbox.selection_set(i)
-        self.listbox.activate(i)
-        r = self.results[i]
-        p = r["path"]
-        self.heading.config(text=Path(p).name)
-        self.counter.config(text=f"{i+1} / {len(self.results)}")
-        self.summary.delete("1.0", "end")
-        self.details.delete("1.0", "end")
-
-        x = r["info"]
-        if r["error"] or not x:
-            self.summary.insert("end", "ERREUR D'ANALYSE\n", "err")
-            self.summary.insert("end", r["error"] or "Aucune donnee exploitable.", "val_normal")
-            return
-
-        cam_tag = "err" if "non identifie" in (x["make"] + x["model"]).lower() else "camera"
-        self._insert_kv(self.summary, "Fabricant : ", x["make"], cam_tag, "   |   ")
-        self._insert_kv(self.summary, "Modele : ", x["model"], cam_tag, "\n")
-
-        prof_low = x["profile"].lower()
-        if "log" in prof_low or "hlg" in prof_low:
-            prof_tag = "log"
-        elif "709" in prof_low or "normal" in prof_low or "cinetone" in prof_low:
-            prof_tag = "rec709"
-        else:
-            prof_tag = "err"
-        self._insert_kv(self.summary, "Profil detecte : ", x["profile"], prof_tag, "\n")
-
-        conf_low = x["confidence"].lower()
-        conf_tag = "ok" if "confirme" in conf_low else ("warn" if "probable" in conf_low else "err")
-        self._insert_kv(self.summary, "Gamut : ", x["gamut"], prof_tag, "   |   ")
-        self._insert_kv(self.summary, "Confiance : ", x["confidence"], conf_tag, "\n")
-
-        xml_tag = "ok" if x["xml_found"].startswith("Oui") else "label"
-        self._insert_kv(self.summary, "Fichier Sidecar XML : ", x["xml_found"], xml_tag, "\n")
-        self._insert_kv(self.summary, "Detection : ", x["method"], "val_normal", "\n\n")
-
-        self.summary.insert("end", "REGLAGE / CONSEIL POUR DAVINCI RESOLVE :\n", "cst_title")
-        self.summary.insert("end", x["action"], "cst_body")
-
-        bit_tag = "ok" if "10 bit" in x["bitdepth"].lower() or "12 bit" in x["bitdepth"].lower() else ("warn" if "8 bit" in x["bitdepth"].lower() else "val_normal")
-        info_lines = [
-            ("Resolution", x["resolution"], "val_normal"),
-            ("Cadence", x["fps"], "val_normal"),
-            ("Codec / Profil", x["codec"], "camera"),
-            ("Profondeur / Chroma", x["bitdepth"], bit_tag),
-            ("ColorPrimaries", x["primaries"], "rec709" if "709" in x["primaries"] else "log"),
-            ("TransferCharacteristics", x["transfer"], "rec709" if "709" in x["transfer"] else "log"),
-            ("MatrixCoefficients", x["matrix"], "val_normal"),
-        ]
-        for k, v, vtag in info_lines:
-            self.details.insert("end", f"{k:<25} ", "label")
-            self.details.insert("end", f"{v}\n", vtag)
-
-        self.details.insert("end", "\n--- Tags detailles (XML / MediaInfo / ExifTool) ---\n", "cst_title")
-        selected = all_values(r["data"], [
-            r"^XML:", r"^MI:", r"model", r"make", r"manufacturer",
-            r"application", r"supplier", r"log", r"gamut", r"color",
-            r"primar", r"transfer", r"gamma", r"codec", r"lens",
-            r"camera", r"dji", r"encoder", r"iso", r"white"
-        ])
-        for k, v in selected[:250]:
-            if k.startswith("XML:"):
-                k_tag = "xml_tag"
-            elif k.startswith("MI:"):
-                k_tag = "mi_tag"
-            else:
-                k_tag = "exif_tag"
-
-            v_low = v.lower()
-            if any(w in v_low for w in ("s-log", "slog", "d-log", "dlog", "f-log", "v-log", "clog", "logc", "s-gamut")):
-                v_tag = "log"
-            elif any(w in v_low for w in ("709", "cinetone")):
-                v_tag = "rec709"
-            elif any(w in v_low for w in ("dji", "sony", "canon", "fuji", "panasonic", "arri", "red")):
-                v_tag = "camera"
-            else:
-                v_tag = "val_normal"
-
-            self.details.insert("end", f"{k}", k_tag)
-            self.details.insert("end", " = ", "label")
-            self.details.insert("end", f"{v}\n", v_tag)
-
-    def export_csv(self):
-        valid = [r for r in self.results if r is not None]
-        if not valid:
-            messagebox.showwarning("Export CSV", "Aucune video analysee a exporter.")
-            return
-        if self.busy:
-            messagebox.showinfo("Analyse en cours", "Attendez la fin de l'analyse avant d'exporter.")
-            return
-
-        default_name = "Rapport_Cameras_Tournage.csv"
-        if len(valid) == 1:
-            default_name = Path(valid[0]["path"]).stem + "_rapport.csv"
-
-        out = filedialog.asksaveasfilename(
-            title="Enregistrer le tableau recapitulatif CSV",
-            defaultextension=".csv",
-            initialfile=default_name,
-            filetypes=[("Fichier CSV (Excel)", "*.csv"), ("Tous les fichiers", "*.*")]
-        )
-        if not out:
-            return
-
-        headers = [
-            "Nom du fichier", "Fabricant", "Modele", "Profil couleur",
-            "Gamut", "Confiance", "Resolution", "Cadence (FPS)",
-            "Codec / Profil", "Profondeur / Chroma", "Fichier XML",
-            "Reglage CST DaVinci Resolve", "Chemin complet"
-        ]
-
-        try:
-            with open(out, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f, delimiter=";")
-                writer.writerow(headers)
-                for r in valid:
-                    p = Path(r["path"])
-                    if r["error"] or not r["info"]:
-                        writer.writerow([p.name, "ERREUR", "", "", "", "", "", "", "", "", "", r["error"] or "Erreur", str(p)])
-                    else:
-                        x = r["info"]
-                        writer.writerow([
-                            p.name, x["make"], x["model"], x["profile"],
-                            x["gamut"], x["confidence"], x["resolution"], x["fps"],
-                            x["codec"], x["bitdepth"], x["xml_found"],
-                            x["action"], str(p)
-                        ])
-            self.status.config(text=f"CSV exporte ({len(valid)} fichiers)")
-            messagebox.showinfo("Export CSV reussi", f"Le tableau recapitulatif de {len(valid)} video(s) a ete enregistre :\n{out}")
-        except Exception as e:
-            messagebox.showerror("Erreur d'export CSV", str(e))
-
-    def export_dump(self):
-        if not self.results or self.results[self.index] is None:
-            return
-        r = self.results[self.index]
-        out = filedialog.asksaveasfilename(defaultextension=".json", initialfile=Path(r["path"]).stem + "_exiftool_v5.json",
-                                           filetypes=[("JSON", "*.json"), ("Tous les fichiers", "*.*")])
-        if not out:
-            return
-        with open(out, "w", encoding="utf-8") as f:
-            json.dump(r["data"], f, ensure_ascii=False, indent=1)
-        self.status.config(text="Tags JSON exportes")
-
-    def copy_report(self):
-        if not self.results or self.results[self.index] is None:
-            return
-        r = self.results[self.index]
-        if r["error"]:
-            text = f"{r['path']}\nErreur: {r['error']}"
-        else:
-            text = f"Fichier: {r['path']}\n" + self.summary.get("1.0", "end") + "\n\n" + self.details.get("1.0", "end")
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.status.config(text="Rapport copie dans le presse-papiers")
+    return sorted(set(hits))
 
 
-def main():
-    try:
-        from tkinterdnd2 import TkinterDnD
-        root = TkinterDnD.Tk()
-    except Exception:
-        root = tk.Tk()
-    App(root)
-    root.mainloop()
+def arri_uint(data):
+    return int.from_bytes(data, "big", signed=False)
 
 
-if __name__ == "__main__":
-    main() 
+def arri_sint(data):
+    return int.from_bytes(data, "big", signed=True)
+
+
+def arri_float32(data):
+    return struct.unpack(">f", data)[0]
+
+
+def arri_rational(data):
+    numerator = arri_uint(data[:4])
+    denominator = arri_uint(data[4:8])
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def arri_decode_fields(sets):
+    row = {}
+    position = arri_parse_klv(sets.get(ARRI_SET_KEYS["position"], b""))
+    lens = arri_parse_klv(sets.get(ARRI_SET_KEYS["lens"], b""))
+    capture = arri_parse_klv(sets.get(ARRI_SET_KEYS["capture"], b""))
+
+    def get(mapping, name):
+        return mapping.get(ARRI_FIELD_KEYS[name])
+
+    value = get(position, "tilt")
+    row["Tilt_deg"] = arri_float32(value) if value and len(value) == 4 else None
+
+    value = get(position, "roll")
+    row["Roll_deg"] = arri_float32(value) if value and len(value) == 4 else None
+
+    value = get(lens, "focus_metric")
+    row["Focus_
