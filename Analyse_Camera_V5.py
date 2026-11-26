@@ -1895,7 +1895,8 @@ class App:
             relief="flat",
             padx=12,
             pady=8,
-            borderwidth=1
+            borderwidth=1,
+            undo=True
         )
         self.details.pack(fill="both", expand=True)
 
@@ -2449,47 +2450,6 @@ class App:
         else:
             self.arri_frame.pack_forget()
 
-    def _filter_files(self, *args):
-        """Filtre la liste des fichiers selon la recherche et le filtre sélectionné."""
-        search_term = self.search_var.get().lower()
-        filter_type = self.filter_var.get()
-        
-        # Réinitialiser la liste
-        self.listbox.delete(0, tk.END)
-        
-        # Filtrer les fichiers
-        filtered_files = []
-        for i, file_path in enumerate(self.files):
-            file_name = Path(file_path).name
-            
-            # Vérifier le filtre de type
-            should_show = True
-            if filter_type != "Tous" and self.results:
-                result = self.results[i]
-                if result is not None:
-                    confidence = result.get("confidence", "")
-                    if filter_type == "Confirme" and "Confirmé" not in confidence:
-                        should_show = False
-                    elif filter_type == "Probable" and "Probable" not in confidence:
-                        should_show = False
-                    elif filter_type == "Erreur" and "Erreur" not in str(result):
-                        should_show = False
-            
-            # Vérifier le terme de recherche
-            if should_show and search_term in file_name.lower():
-                filtered_files.append(file_path)
-        
-        # Afficher les fichiers filtrés
-        for file_path in filtered_files:
-            self.listbox.insert(tk.END, Path(file_path).name)
-
-    def _reset_filters(self):
-        """Réinitialise les filtres de recherche et de type."""
-        self.search_var.set("")
-        self.filter_var.set("Tous")
-        self.listbox.delete(0, tk.END)
-        for file_path in self.files:
-            self.listbox.insert(tk.END, Path(file_path).name)
 
         info_lines = [
             ("Résolution", x["resolution"], "val_normal"),
@@ -2531,28 +2491,88 @@ class App:
             "cst_title"
         )
 
-        selected = all_values(
-            r["data"],
-            [
-                r"^XML:", r"^MI:", r"model", r"make", r"manufacturer",
-                r"device", r"software", r"handler", r"writing", r"android",
-                r"quicktime", r"application", r"supplier", r"log", r"gamut",
-                r"color", r"primar", r"transfer", r"gamma", r"codec",
-                r"lens", r"camera", r"dji", r"encoder", r"iso", r"white"
-            ]
-        )
-
-        for k, v in selected[:250]:
-            if k.startswith("XML:"):
-                k_tag = "xml_tag"
-            elif k.startswith("MI:"):
-                k_tag = "mi_tag"
+        
+        try:
+            selected = all_values(
+                r["data"],
+                [
+                    r"^XML:", r"^MI:", r"model", r"make", r"manufacturer",
+                    r"device", r"software", r"handler", r"writing", r"android",
+                    r"quicktime", r"application", r"supplier", r"log", r"gamut",
+                    r"color", r"primar", r"transfer", r"gamma", r"codec",
+                    r"lens", r"camera", r"dji", r"encoder", r"iso", r"white",
+                    r"manufacturer", r"model", r"serial", r"device", r"camera",
+                    r"recording", r"acquisition", r"capture", r"video", r"audio",
+                    r"Sony", r"XAVC", r"HLG", r"Rec\.2100", r"BT\.709"
+                ]
+            )
+            
+            if not selected:
+                self.details.insert("end", "Aucun tag technique détecté.\n", "warn")
+                self.details.insert("end", "Note : Les métadonnées techniques peuvent être présentes dans les fichiers XML sidecar pour les caméras Sony/Canon.\n", "label")
             else:
-                k_tag = "exif_tag"
+                self.details.insert("end", f"Nombre de tags trouvés : {len(selected)}\n", "label")
+                for k, v in selected[:250]:
+                    if k.startswith("XML:"):
+                        k_tag = "xml_tag"
+                    elif k.startswith("MI:"):
+                        k_tag = "mi_tag"
+                    else:
+                        k_tag = "exif_tag"
 
-            self.details.insert("end", f"{k}", k_tag)
-            self.details.insert("end", " = ", "label")
-            self.details.insert("end", f"{v}\n", "val_normal")
+                    self.details.insert("end", f"{k}", k_tag)
+                    self.details.insert("end", " = ", "label")
+                    self.details.insert("end", f"{v}\n", "val_normal")
+                    
+        except Exception as e:
+            self.details.insert("end", "\n=== ERREUR D'ANALYSE ===\n", "err")
+            self.details.insert("end", f"Erreur lors de l'analyse : {str(e)}\n", "err")
+            self.details.insert("end", "Le fichier est analysé mais des problèmes techniques empêchent l'affichage.\n", "label")
+        
+        self.details.insert("end", "\n--- FIN DU TRAITEMENT ---\n", "cst_title") 
+
+
+    def _filter_files(self, *args):
+        """Filtre la liste des fichiers selon la recherche et le filtre sélectionné."""
+        search_term = self.search_var.get().lower()
+        filter_type = self.filter_var.get()
+        
+        # Réinitialiser la liste
+        self.listbox.delete(0, tk.END)
+        
+        # Filtrer les fichiers
+        filtered_files = []
+        for i, file_path in enumerate(self.files):
+            file_name = Path(file_path).name
+            
+            # Vérifier le filtre de type
+            should_show = True
+            if filter_type != "Tous" and self.results:
+                result = self.results[i]
+                if result is not None:
+                    confidence = result.get("confidence", "")
+                    if filter_type == "Confirme" and "Confirmé" not in confidence:
+                        should_show = False
+                    elif filter_type == "Probable" and "Probable" not in confidence:
+                        should_show = False
+                    elif filter_type == "Erreur" and "Erreur" not in str(result):
+                        should_show = False
+            
+            # Vérifier le terme de recherche
+            if should_show and search_term in file_name.lower():
+                filtered_files.append(file_path)
+        
+        # Afficher les fichiers filtrés
+        for file_path in filtered_files:
+            self.listbox.insert(tk.END, Path(file_path).name)
+
+    def _reset_filters(self):
+        """Réinitialise les filtres de recherche et de type."""
+        self.search_var.set("")
+        self.filter_var.set("Tous")
+        self.listbox.delete(0, tk.END)
+        for file_path in self.files:
+            self.listbox.insert(tk.END, Path(file_path).name)
 
     def export_csv(self):
         valid = [r for r in self.results if r is not None]
