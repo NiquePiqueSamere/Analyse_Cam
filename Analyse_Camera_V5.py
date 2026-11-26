@@ -176,6 +176,54 @@ CAMERA_PROFILES = [
         ),
     },
     {
+        "id": "sony_slog3",
+        "priority": 13,
+        "make_override": "Sony",
+        "model_hint": "",
+        "match_regex": r"\bs-logs?\s*3\b|slog3|sony.*log.*3",
+        "confirmed": "Sony S-Log3",
+        "probable": "",
+        "gamut": "S-Gamut3.Cine / S-Gamut3",
+        "confidence": "Confirmé",
+        "method": "Tag Sony S-Log3 détecté.",
+        "action": (
+            "CST DaVinci Resolve : Input Color Space = S-Gamut3.Cine, "
+            "Input Gamma = Sony S-Log3 -> DaVinci Wide Gamut / Intermediate."
+        ),
+    },
+    {
+        "id": "sony_slog2",
+        "priority": 14,
+        "make_override": "Sony",
+        "model_hint": "",
+        "match_regex": r"\bs-logs?\s*2\b|slog2|sony.*log.*2",
+        "confirmed": "Sony S-Log2",
+        "probable": "",
+        "gamut": "S-Gamut",
+        "confidence": "Confirmé",
+        "method": "Tag Sony S-Log2 détecté.",
+        "action": (
+            "CST DaVinci Resolve : Input Color Space = S-Gamut, "
+            "Input Gamma = Sony S-Log2 -> DaVinci Wide Gamut / Intermediate."
+        ),
+    },
+    {
+        "id": "apple_log",
+        "priority": 15,
+        "make_override": "Apple",
+        "model_hint": "",
+        "match_regex": r"\bapple.*log\b|applelog",
+        "confirmed": "Apple Log",
+        "probable": "",
+        "gamut": "Apple Wide Gamut",
+        "confidence": "Confirmé",
+        "method": "Tag Apple Log détecté.",
+        "action": (
+            "CST DaVinci Resolve : Input Color Space = Apple Wide Gamut, "
+            "Input Gamma = Apple Log -> DaVinci Wide Gamut / Intermediate."
+        ),
+    },
+    {
         "id": "fujifilm_flog2",
         "priority": 30,
         "make_override": "Fujifilm",
@@ -239,6 +287,22 @@ CAMERA_PROFILES = [
         "confidence": "Probable",
         "method": "Flux GoPro détecté sans tag GP-Log explicite.",
         "action": "Proposition avec avertissement : vérifier Flat vs GoPro Color et plage Full/Limited.",
+    },
+    {
+        "id": "canon_log3",
+        "priority": 35,
+        "make_override": "Canon",
+        "model_hint": "",
+        "match_regex": r"\bcanon.*log.*3\b|clog3|canonlog3",
+        "confirmed": "Canon Log 3",
+        "probable": "",
+        "gamut": "Canon Cinema Gamut",
+        "confidence": "Confirmé",
+        "method": "Tag Canon Log 3 détecté.",
+        "action": (
+            "CST DaVinci Resolve : Input Color Space = Canon Cinema Gamut, "
+            "Input Gamma = Canon Log 3 -> DaVinci Wide Gamut / Intermediate."
+        ),
     },
 ]
 
@@ -506,11 +570,19 @@ def find_exiftool():
             Path("/usr/local/bin/exiftool")
         ]
 
+    # Precompile regex patterns for better performance
+    exiftool_pattern = re.compile(r"exiftool", re.IGNORECASE)
+    
     for p in candidates:
         if p.is_file() and _exiftool_usable(p):
             return str(p)
 
-    return shutil.which("exiftool") or shutil.which("exiftool.exe")
+    # Check system PATH with precompiled pattern
+    system_path_result = shutil.which("exiftool") or shutil.which("exiftool.exe")
+    if system_path_result:
+        return system_path_result
+
+    return None
 
 
 def mxf_camera_identity(data):
@@ -847,6 +919,15 @@ def analyze_arri_mxf(path, exiftool_path, progress_callback=None):
 # DÉTECTION D'INCOHÉRENCES COLORIMÉTRIQUES & ANDROID
 # ==================================================
 
+# Precompile regex patterns for better performance
+import re
+
+# Compile frequently used patterns once
+CANONICAL_COLOR_PATTERN_709 = re.compile(r".*709.*", re.IGNORECASE)
+CANONICAL_COLOR_PATTERN_2020 = re.compile(r".*2020.*", re.IGNORECASE)
+CANONICAL_COLOR_PATTERN_HLG = re.compile(r".*hlg.*", re.IGNORECASE)
+CANONICAL_COLOR_PATTERN_PQ = re.compile(r".*(pq|2084).*", re.IGNORECASE)
+
 def _canonical_color_token(val):
     s = str(val).strip().lower()
     if not s or s in ("unspecified", "unknown", "non renseigne", "non renseigné"):
@@ -857,13 +938,13 @@ def _canonical_color_token(val):
         return "bt470_bg_bt601"
     if "601" in s:
         return "bt601"
-    if "709" in s:
+    if CANONICAL_COLOR_PATTERN_709.search(s):
         return "bt709"
-    if "2020" in s:
+    if CANONICAL_COLOR_PATTERN_2020.search(s):
         return "bt2020"
-    if "2100" in s and "hlg" in s:
+    if CANONICAL_COLOR_PATTERN_HLG.search(s):
         return "bt2100_hlg"
-    if "2100" in s and ("pq" in s or "2084" in s):
+    if CANONICAL_COLOR_PATTERN_PQ.search(s):
         return "bt2100_pq"
     if "hlg" in s or "b67" in s:
         return "hlg"
@@ -1600,6 +1681,15 @@ class App:
         self._build()
         self.apply_theme("dark")
         self.root.after(100, self._poll)
+        
+        # Initialisation de l'état de la barre de status
+        self.status = ttk.Label(
+            self.top,
+            text="Prêt",
+            font=(MONO_FONT, 9)
+        )
+        self.status.pack(side="right")
+        self._show_status()
 
         try:
             from tkinterdnd2 import DND_FILES
@@ -1647,14 +1737,7 @@ class App:
         self.copy_btn.pack(side="left", padx=(0, 6))
         self.buttons.append(self.copy_btn)
 
-        for label, cmd in [
-            ("Exporter CSV...", self.export_csv),
-            ("JSON...", self.export_dump),
-        ]:
-            b = RoundedButton(self.top, text=label, command=cmd)
-            b.pack(side="left", padx=(0, 6))
-            self.buttons.append(b)
-
+        # Ajout du bouton de changement de thème
         self.theme_btn = RoundedButton(
             self.top,
             text="Mode Clair",
@@ -1663,12 +1746,13 @@ class App:
         self.theme_btn.pack(side="right", padx=(12, 0))
         self.buttons.append(self.theme_btn)
 
-        self.status = ttk.Label(
-            self.top,
-            text="Prêt",
-            font=(MONO_FONT, 9)
-        )
-        self.status.pack(side="right")
+        for label, cmd in [
+            ("Exporter CSV...", self.export_csv),
+            ("JSON...", self.export_dump),
+        ]:
+            b = RoundedButton(self.top, text=label, command=cmd)
+            b.pack(side="left", padx=(0, 6))
+            self.buttons.append(b)
 
         self.drop_label = tk.Label(
             self.root,
@@ -1705,6 +1789,23 @@ class App:
         self.listbox.pack(fill="both", expand=True, pady=5)
         self.listbox.bind("<<ListboxSelect>>", self._select)
 
+        ttk.Label(
+            left,
+            text="FICHIERS ANALYSÉS",
+            font=(MONO_FONT, 10, "bold")
+        ).pack(anchor="w")
+
+        self.listbox = tk.Listbox(
+            left,
+            width=36,
+            activestyle="dotbox",
+            borderwidth=1,
+            highlightthickness=0,
+            font=(MONO_FONT, 9)
+        )
+        self.listbox.pack(fill="both", expand=True, pady=5)
+        self.listbox.bind("<<ListboxSelect>>", self._select)
+
         right = ttk.Frame(self.body, padding=8)
         self.body.add(right, weight=4)
 
@@ -1716,6 +1817,9 @@ class App:
         )
         self.heading.pack(anchor="w", pady=(0, 6))
 
+        self.summary_frame = tk.Frame(right, bg="#2c313c")
+        self.summary_frame.pack(fill="x", pady=(0, 4))
+        
         self.summary = tk.Text(
             right,
             height=11,
@@ -1724,8 +1828,11 @@ class App:
             relief="flat",
             padx=12,
             pady=8,
-            borderwidth=1
+            borderwidth=1,
+            bg="#2c313c",  # Fond sombre
+            fg="#ffffff"   # Texte blanc
         )
+        self.summary.pack(fill="both", expand=True)
         self.summary.pack(fill="x", pady=3)
 
         ttk.Label(
@@ -2358,6 +2465,48 @@ class App:
             self._render_arri_frame(arri_rows[0])
         else:
             self.arri_frame.pack_forget()
+
+    def _filter_files(self, *args):
+        """Filtre la liste des fichiers selon la recherche et le filtre sélectionné."""
+        search_term = self.search_var.get().lower()
+        filter_type = self.filter_var.get()
+        
+        # Réinitialiser la liste
+        self.listbox.delete(0, tk.END)
+        
+        # Filtrer les fichiers
+        filtered_files = []
+        for i, file_path in enumerate(self.files):
+            file_name = Path(file_path).name
+            
+            # Vérifier le filtre de type
+            should_show = True
+            if filter_type != "Tous" and self.results:
+                result = self.results[i]
+                if result is not None:
+                    confidence = result.get("confidence", "")
+                    if filter_type == "Confirme" and "Confirmé" not in confidence:
+                        should_show = False
+                    elif filter_type == "Probable" and "Probable" not in confidence:
+                        should_show = False
+                    elif filter_type == "Erreur" and "Erreur" not in str(result):
+                        should_show = False
+            
+            # Vérifier le terme de recherche
+            if should_show and search_term in file_name.lower():
+                filtered_files.append(file_path)
+        
+        # Afficher les fichiers filtrés
+        for file_path in filtered_files:
+            self.listbox.insert(tk.END, Path(file_path).name)
+
+    def _reset_filters(self):
+        """Réinitialise les filtres de recherche et de type."""
+        self.search_var.set("")
+        self.filter_var.set("Tous")
+        self.listbox.delete(0, tk.END)
+        for file_path in self.files:
+            self.listbox.insert(tk.END, Path(file_path).name)
 
         info_lines = [
             ("Résolution", x["resolution"], "val_normal"),
